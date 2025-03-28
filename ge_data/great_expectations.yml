@@ -1,0 +1,41 @@
+config_version: 3.0
+datasources:
+  pandas_datasource:
+    class_name: Datasource
+    module_name: great_expectations.datasource
+    execution_engine:
+      class_name: PandasExecutionEngine
+      module_name: great_expectations.execution_engine
+    data_connectors:
+      runtime_data_connector:
+        class_name: RuntimeDataConnector
+        batch_identifiers:
+          - default_identifier_name
+stores:
+  expectations_store:
+    class_name: ExpectationsStore
+    store_backend:
+      class_name: TupleFilesystemStoreBackend
+      base_directory: ge_data/expectations
+  validations_store:
+    class_name: ValidationsStore
+    store_backend:
+      class_name: TupleFilesystemStoreBackend
+      base_directory: ge_data/uncommitted/validations
+  evaluation_parameter_store:
+    class_name: EvaluationParameterStore
+  data_docs_store:
+    class_name: DataDocsStore
+    store_backend:
+      class_name: TupleFilesystemStoreBackend
+      base_directory: ge_data/uncommitted/data_docs
+data_docs_sites:
+  local_site:
+    class_name: SiteBuilder
+    store_backend:
+      class_name: TupleFilesystemStoreBackend
+      base_directory: ge_data/uncommitted/data_docs
+    site_index_builder:
+      class_name: DefaultSiteIndexBuilder
+anonymous_usage_statistics:
+  enabled: false
