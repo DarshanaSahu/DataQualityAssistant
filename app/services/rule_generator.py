@@ -49,8 +49,16 @@ class AIRuleGenerator:
         Columns: {schema_info['columns']}
         Sample Data: {schema_info['sample_data'][:5]}  # First 5 rows
         
-        Generate rules in Great Expectations format. Return as a JSON array of rule configurations.
-        Make sure the response is valid JSON that can be parsed by Python's eval() function.
+        Generate rules in Great Expectations format. Each rule should be a dictionary with the following structure:
+        {{
+            "expectation_type": "expect_column_values_to_not_be_null",
+            "kwargs": {{
+                "column": "column_name",
+                "mostly": 0.95
+            }}
+        }}
+        
+        Return as a list of such rule configurations. Make sure the response is valid JSON that can be parsed by Python's json.loads() function.
         """
         
         response = self.client.messages.create(
@@ -66,8 +74,46 @@ class AIRuleGenerator:
         )
         
         # Parse and validate the generated rules
-        rules = eval(response.content[0].text)
-        return rules
+        try:
+            import json
+            rules = json.loads(response.content[0].text)
+            if not isinstance(rules, list):
+                rules = [rules]
+            
+            # Validate and format each rule
+            formatted_rules = []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                    
+                # Ensure the rule has the required structure
+                formatted_rule = {
+                    "expectation_type": rule.get("expectation_type", ""),
+                    "kwargs": rule.get("kwargs", {})
+                }
+                
+                # Only add valid rules
+                if formatted_rule["expectation_type"] and formatted_rule["kwargs"]:
+                    formatted_rules.append(formatted_rule)
+            
+            return formatted_rules if formatted_rules else [{
+                "expectation_type": "expect_column_values_to_not_be_null",
+                "kwargs": {
+                    "column": schema_info['columns'][0]['column_name'],
+                    "mostly": 0.95
+                }
+            }]
+            
+        except Exception as e:
+            print(f"Error parsing rules: {str(e)}")
+            # Return a default rule if parsing fails
+            return [{
+                "expectation_type": "expect_column_values_to_not_be_null",
+                "kwargs": {
+                    "column": schema_info['columns'][0]['column_name'],
+                    "mostly": 0.95
+                }
+            }]
 
     def check_rule_outdated(self, rule_id: int, table_name: str) -> Dict[str, Any]:
         """Check if a rule is outdated based on current data patterns."""
