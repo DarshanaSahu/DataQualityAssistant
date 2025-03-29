@@ -20,7 +20,8 @@ class AIRuleGenerator:
                 ORDER BY ordinal_position;
             """)
             result = connection.execute(query, {"table_name": table_name})
-            columns = [dict(row) for row in result]
+            # Convert Row objects to dictionaries properly
+            columns = [{"column_name": row[0], "data_type": row[1], "is_nullable": row[2], "column_default": row[3]} for row in result]
             
             # Get sample data
             sample_query = text(f"SELECT * FROM {table_name} LIMIT 100")
@@ -167,4 +168,84 @@ class AIRuleGenerator:
                 ]
             )
             
-            return eval(response.content[0].text) 
+            return eval(response.content[0].text)
+
+    def generate_rule_from_description(self, table_name: str, rule_description: str) -> List[Dict[str, Any]]:
+        """Generate a rule from natural language description."""
+        schema_info = self.analyze_table_schema(table_name)
+        
+        # Prepare prompt for Claude
+        prompt = f"""You are a data quality expert specializing in Great Expectations rules generation.
+        Based on the following natural language description, generate an appropriate Great Expectations rule.
+        
+        Table: {table_name}
+        Columns: {schema_info['columns']}
+        Sample Data: {schema_info['sample_data'][:5]}  # First 5 rows
+        Rule Description: {rule_description}
+        
+        Generate a rule in Great Expectations format that matches the described requirement.
+        The rule should be a dictionary with the following structure:
+        {{
+            "expectation_type": "appropriate_expectation_type",
+            "kwargs": {{
+                "column": "column_name",
+                "other_parameters": "as_needed"
+            }}
+        }}
+        
+        Return as a list containing a single rule configuration. Make sure the response is valid JSON that can be parsed by Python's json.loads() function.
+        """
+        
+        response = self.client.messages.create(
+            model="claude-3-sonnet-20240229",
+            max_tokens=4000,
+            temperature=0.7,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+        
+        # Parse and validate the generated rule
+        try:
+            import json
+            rules = json.loads(response.content[0].text)
+            if not isinstance(rules, list):
+                rules = [rules]
+            
+            # Validate and format the rule
+            formatted_rules = []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                    
+                # Ensure the rule has the required structure
+                formatted_rule = {
+                    "expectation_type": rule.get("expectation_type", ""),
+                    "kwargs": rule.get("kwargs", {})
+                }
+                
+                # Only add valid rules
+                if formatted_rule["expectation_type"] and formatted_rule["kwargs"]:
+                    formatted_rules.append(formatted_rule)
+            
+            return formatted_rules if formatted_rules else [{
+                "expectation_type": "expect_column_values_to_not_be_null",
+                "kwargs": {
+                    "column": schema_info['columns'][0]['column_name'],
+                    "mostly": 0.95
+                }
+            }]
+            
+        except Exception as e:
+            print(f"Error parsing rule: {str(e)}")
+            # Return a default rule if parsing fails
+            return [{
+                "expectation_type": "expect_column_values_to_not_be_null",
+                "kwargs": {
+                    "column": schema_info['columns'][0]['column_name'],
+                    "mostly": 0.95
+                }
+            }] 

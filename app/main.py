@@ -10,7 +10,7 @@ from app.services.quality_engine import DataQualityEngine
 from app.models.rule import Rule, RuleVersion
 from pydantic import BaseModel
 import os
-from sqlalchemy import text, inspect
+from sqlalchemy import text, inspect, cast, String, JSON
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -53,6 +53,11 @@ class RuleCreate(BaseModel):
     table_name: str
     rule_config: dict
 
+class NaturalLanguageRuleCreate(BaseModel):
+    table_name: str
+    rule_description: str
+    rule_name: str = "Natural Language Generated Rule"
+
 class RuleResponse(BaseModel):
     id: int
     name: str
@@ -71,7 +76,18 @@ class RuleExecutionRequest(BaseModel):
 class RuleExecutionResponse(BaseModel):
     table_name: str
     execution_time: str
+    total_duration: float
+    total_rules: int
+    successful_rules: int
+    failed_rules: int
+    success_rate: float
     results: List[dict]
+
+class RuleUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    rule_config: dict | None = None
+    is_active: bool | None = None
 
 # Initialize services
 try:
@@ -89,46 +105,55 @@ except Exception as e:
 @app.post(f"{settings.API_V1_STR}/rules/generate", response_model=List[RuleResponse])
 async def generate_rules(table_name: str, db: Session = Depends(get_db)):
     """Generate rules for a table using AI."""
-    try:
-        rules = rule_generator.generate_rules(table_name)
-        created_rules = []
-        
-        for rule_config in rules:
-            # Ensure rule_config is a valid dictionary
-            if not isinstance(rule_config, dict):
-                continue
-                
-            # Create a new rule with proper structure
-            rule = Rule(
-                name=f"AI Generated Rule for {table_name}",
-                description="Automatically generated rule based on data analysis",
-                table_name=table_name,
-                rule_config={
-                    "expectation_type": rule_config.get("expectation_type", ""),
-                    "kwargs": rule_config.get("kwargs", {})
-                },
-                is_active=True
-            )
+    rules = rule_generator.generate_rules(table_name)
+    print(rules)
+    created_rules = []
+    
+    for rule_config in rules:
+        # Ensure rule_config is a valid dictionary
+        if not isinstance(rule_config, dict):
+            continue
             
-            try:
-                db.add(rule)
-                db.commit()
-                db.refresh(rule)
-                created_rules.append(rule)
-            except Exception as e:
-                db.rollback()
-                print(f"Error creating rule: {str(e)}")
-                continue
+        # Check if a similar rule already exists
+        existing_rule = db.query(Rule).filter(
+            Rule.table_name == table_name,
+            cast(Rule.rule_config['expectation_type'], String) == rule_config.get("expectation_type", ""),
+            cast(Rule.rule_config['kwargs'], String) == str(rule_config.get("kwargs", {}))
+        ).first()
         
-        if not created_rules:
-            raise HTTPException(
-                status_code=500,
-                detail="No valid rules were created"
-            )
+        if existing_rule:
+            print(f"Skipping duplicate rule: {rule_config}")
+            continue
             
-        return created_rules
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Create a new rule with proper structure
+        rule = Rule(
+            name=f"AI Generated Rule for {table_name}",
+            description="Automatically generated rule based on data analysis",
+            table_name=table_name,
+            rule_config={
+                "expectation_type": rule_config.get("expectation_type", ""),
+                "kwargs": rule_config.get("kwargs", {})
+            },
+            is_active=True
+        )
+        
+        try:
+            db.add(rule)
+            db.commit()
+            db.refresh(rule)
+            created_rules.append(rule)
+        except Exception as e:
+            db.rollback()
+            print(f"Error creating rule: {str(e)}")
+            continue
+    
+    if not created_rules:
+        raise HTTPException(
+            status_code=500,
+            detail="No valid rules were created"
+        )
+        
+    return created_rules
 
 @app.get(f"{settings.API_V1_STR}/rules/check-outdated/{{rule_id}}")
 async def check_rule_outdated(rule_id: int, db: Session = Depends(get_db)):
@@ -159,6 +184,8 @@ async def execute_rules(request: RuleExecutionRequest):
         quality_engine.generate_report(results, report_path)
         
         return results
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -176,30 +203,73 @@ async def get_rule(rule_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Rule not found")
     return rule
 
-@app.get(f"{settings.API_V1_STR}/database/connect", response_model=DatabaseConnectionResponse)
-async def connect_database():
-    """Test database connection and return available tables."""
+@app.put(f"{settings.API_V1_STR}/rules/{{rule_id}}", response_model=RuleResponse)
+async def update_rule(
+    rule_id: int,
+    rule_update: RuleUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update a specific rule."""
     try:
-        # Test connection
-        with engine.connect() as connection:
-            # Get list of tables
-            result = connection.execute(text("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public'
-            """))
-            tables = [row[0] for row in result]
-            
-            return DatabaseConnectionResponse(
-                status="success",
-                message="Successfully connected to database",
-                database_url=settings.DATABASE_URL,
-                tables=tables
-            )
+        rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        if not rule:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        
+        # Update fields if provided
+        if rule_update.name is not None:
+            rule.name = rule_update.name
+        if rule_update.description is not None:
+            rule.description = rule_update.description
+        if rule_update.rule_config is not None:
+            rule.rule_config = rule_update.rule_config
+        if rule_update.is_active is not None:
+            rule.is_active = rule_update.is_active
+        
+        # Create a new version of the rule
+        new_version = RuleVersion(
+            rule_id=rule.id,
+            version_number=len(rule.versions) + 1,
+            rule_config=rule.rule_config,
+            is_current=True
+        )
+        
+        # Set all other versions as not current
+        for version in rule.versions:
+            version.is_current = False
+        
+        db.add(new_version)
+        db.commit()
+        db.refresh(rule)
+        
+        return rule
     except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to connect to database: {str(e)}"
+            detail=f"Error updating rule: {str(e)}"
+        )
+
+@app.delete(f"{settings.API_V1_STR}/rules/{{rule_id}}")
+async def delete_rule(rule_id: int, db: Session = Depends(get_db)):
+    """Delete a specific rule and its versions."""
+    try:
+        rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        if not rule:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        
+        # Delete all versions first
+        db.query(RuleVersion).filter(RuleVersion.rule_id == rule_id).delete()
+        
+        # Delete the rule
+        db.delete(rule)
+        db.commit()
+        
+        return {"message": "Rule deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error deleting rule: {str(e)}"
         )
 
 @app.get(f"{settings.API_V1_STR}/database/tables", response_model=List[str])
@@ -303,6 +373,61 @@ async def get_table_schema(table_name: str):
             status_code=500,
             detail=f"Failed to get table schema: {str(e)}"
         )
+
+@app.post(f"{settings.API_V1_STR}/rules/generate-from-description", response_model=RuleResponse)
+async def generate_rule_from_description(
+    rule_data: NaturalLanguageRuleCreate,
+    db: Session = Depends(get_db)
+):
+    """Generate a rule from natural language description."""
+    # try:
+        # Generate rule using the rule generator
+    rules = rule_generator.generate_rule_from_description(
+        table_name=rule_data.table_name,
+        rule_description=rule_data.rule_description
+    )
+    
+    if not rules:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not generate valid rule from description"
+        )
+    
+    rule_config = rules[0]
+    
+    # Check if a similar rule already exists
+    existing_rule = db.query(Rule).filter(
+        Rule.table_name == rule_data.table_name,
+        cast(Rule.rule_config['expectation_type'], String) == rule_config.get("expectation_type", ""),
+        cast(Rule.rule_config['kwargs'], String) == str(rule_config.get("kwargs", {}))
+    ).first()
+    
+    if existing_rule:
+        raise HTTPException(
+            status_code=400,
+            detail="A similar rule already exists for this table"
+        )
+    
+    # Create the rule in database
+    rule = Rule(
+        name=rule_data.rule_name,
+        description=rule_data.rule_description,
+        table_name=rule_data.table_name,
+        rule_config=rule_config,
+        is_active=True
+    )
+    
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    
+    return rule
+    # except Exception as e:
+    #     db.rollback()
+    #     raise HTTPException(
+    #         status_code=500,
+    #         detail=f"Error generating rule: {str(e)}"
+    #     )
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
