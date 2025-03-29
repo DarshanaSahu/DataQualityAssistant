@@ -1,62 +1,90 @@
-# AI-Powered Data Quality Assistant
+# Data Quality Assistant
 
-An intelligent data quality management system that leverages Claude AI to generate and manage data quality rules for PostgreSQL databases using Great Expectations.
+A FastAPI-based application for monitoring data quality through rule-based validation. The application uses AI to suggest data quality rules and provides a comprehensive interface for managing and monitoring data quality.
 
 ## Features
 
-### 1. AI Rule Generator
-- Automatic table schema and sample data analysis
-- Claude AI-powered Great Expectations rule generation
-- Natural language to Great Expectations configuration conversion
-- Rule management and versioning
-- Outdated rule detection and recommendations
+- **Data Quality Rule Management**: Create, update, and manage rules for validating data quality.
+- **AI-Powered Rule Suggestions**: Automatically generate rule suggestions based on table data.
+- **Data Analysis**: Analyze table schema and sample data to understand patterns and anomalies.
+- **User-Friendly Error Handling**: Standardized error responses with clear, actionable messages.
+- **CORS Support**: Built-in support for cross-origin resource sharing.
 
-### 2. Data Quality Engine
-- Great Expectations framework integration
-- Automated rule execution
-- Comprehensive quality reports in Excel format
+## Getting Started
 
-## Setup
+### Prerequisites
 
-1. Create a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+- Python 3.8+
+- PostgreSQL or other compatible SQL database
+- Dependencies listed in requirements.txt
+
+### Installation
+
+1. Clone the repository:
+   ```
+   git clone <repository-url>
+   cd DataQualityAssistant
+   ```
 
 2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+   ```
+   pip install -r requirements.txt
+   ```
 
-3. Create a `.env` file with your configuration:
-```
-DATABASE_URL=postgresql://user:password@localhost:5432/dbname
-ANTHROPIC_API_KEY=your_anthropic_api_key
-```
+3. Configure environment variables:
+   Copy `.env.example` to `.env` and update the variables with your configuration.
 
 4. Run the application:
-```bash
-uvicorn app.main:app --reload
-```
-
-## Project Structure
-
-```
-.
-├── app/
-│   ├── api/            # API endpoints
-│   ├── core/           # Core functionality
-│   ├── models/         # Data models
-│   ├── services/       # Business logic
-│   └── utils/          # Utility functions
-├── tests/              # Test files
-├── requirements.txt    # Project dependencies
-└── README.md          # Project documentation
-```
+   ```
+   uvicorn app.main:app --reload
+   ```
 
 ## API Documentation
 
-Once the application is running, visit:
+Once the server is running, you can access the API documentation at:
 - Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc 
+- ReDoc: http://localhost:8000/redoc
+
+## Error Handling
+
+The application implements a standardized error handling system that provides:
+
+- User-friendly error messages
+- Consistent error response structure
+- Appropriate HTTP status codes
+- Detailed logging for troubleshooting
+
+For more details on the error handling implementation, see [ERROR_HANDLING_IMPROVEMENTS.md](docs/ERROR_HANDLING_IMPROVEMENTS.md).
+
+## Testing
+
+Two testing scripts are provided:
+
+1. `testing_error_handling.sh`: Tests API endpoints with various error scenarios to verify error handling.
+
+2. Run the error handling tests:
+   ```
+   ./testing_error_handling.sh
+   ```
+
+## Deployment
+
+To deploy the error handling improvements, you can use the provided script:
+
+```
+./apply_error_handling_improvements.sh
+```
+
+This script:
+- Backs up original files
+- Creates the error handling module
+- Copies documentation
+- Attempts to restart the service
+
+## License
+
+[License information]
+
+## Contributing
+
+[Contribution guidelines] 

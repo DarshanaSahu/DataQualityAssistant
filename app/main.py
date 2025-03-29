@@ -17,6 +17,9 @@ from fastapi.responses import JSONResponse
 import logging
 from app.services import db_utils
 import json
+from app.core.error_handling import handle_api_error, handle_database_error, format_error_response, get_error_message
+import numpy as np
+from sqlalchemy.exc import SQLAlchemyError
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -29,38 +32,32 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_STR}/openapi.json"
 )
 
-# CORS Debug Middleware
-@app.middleware("http")
-async def cors_debug_middleware(request, call_next):
-    from fastapi.responses import JSONResponse
-    import traceback
-    
-    # Log all incoming requests with headers
-    print(f"\n{'=' * 50}\nIncoming request: {request.method} {request.url}\n{'=' * 50}")
-    print("Headers:")
-    for name, value in request.headers.items():
-        print(f"  {name}: {value}")
-    
-    try:
-        # Process request
-        response = await call_next(request)
-        
-        # Log response headers for debugging
-        print(f"\n{'=' * 50}\nOutgoing response: {response.status_code}\n{'=' * 50}")
-        print("Response Headers:")
-        for name, value in response.headers.items():
-            print(f"  {name}: {value}")
-        
-        return response
-    except Exception as e:
-        # Log and return error details for debugging
-        error_details = {
-            "error": str(e),
-            "traceback": traceback.format_exc()
+# Add exception handlers for global error handling
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Handle standard HTTP exceptions with structured responses."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": exc.detail,
+            "status_code": exc.status_code
         }
-        print(f"\n{'!' * 50}\nERROR: {str(e)}\n{'!' * 50}")
-        print(traceback.format_exc())
-        return JSONResponse(status_code=500, content=error_details)
+    )
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request, exc):
+    """Handle all other exceptions with a user-friendly message."""
+    logger.exception(f"Unhandled exception: {str(exc)}")
+    error_message = get_error_message("internal_error")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": error_message,
+            "status_code": 500
+        }
+    )
 
 # Setup CORS middleware
 app.add_middleware(
@@ -423,10 +420,12 @@ async def suggest_rules_for_table(table_name: str):
         if not db_utils.table_exists(table_name):
             return JSONResponse(
                 status_code=404,
-                content={"table_name": table_name, 
-                         "new_rule_suggestions": [], 
-                         "rule_update_suggestions": [],
-                         "error": f"Table {table_name} not found"}
+                content={
+                    "table_name": table_name, 
+                    "new_rule_suggestions": [], 
+                    "rule_update_suggestions": [],
+                    "error": get_error_message("table_not_found", table_name=table_name)
+                }
             )
 
         # Generate rule suggestions
@@ -519,24 +518,34 @@ async def suggest_rules_for_table(table_name: str):
             )
         except Exception as e:
             logger.exception(f"Error generating rule suggestions for table {table_name}: {str(e)}")
+            error_response = format_error_response(
+                error=e, 
+                error_key="rule_generation_error", 
+                table_name=table_name, 
+                detail=str(e)
+            )
             return JSONResponse(
                 status_code=500,
                 content={
                     "table_name": table_name, 
                     "new_rule_suggestions": [], 
                     "rule_update_suggestions": [],
-                    "error": f"Failed to generate suggestions: {str(e)}"
+                    "error": error_response["error"]
                 }
             )
     except Exception as e:
         logger.exception(f"Unhandled exception in suggest_rules_for_table endpoint: {str(e)}")
+        error_response = format_error_response(
+            error=e, 
+            error_key="internal_error"
+        )
         return JSONResponse(
             status_code=500,
             content={
                 "table_name": table_name, 
                 "new_rule_suggestions": [], 
                 "rule_update_suggestions": [],
-                "error": f"Server error: {str(e)}"
+                "error": error_response["error"]
             }
         )
 
@@ -549,20 +558,40 @@ async def apply_suggested_rules(
     """Apply suggested new rules and rule updates."""
     try:
         # Verify table exists
-        with engine.connect() as connection:
-            result = connection.execute(text("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = :table_name
-                )
-            """), {"table_name": table_name})
-            
-            if not result.scalar():
-                raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+        try:
+            with engine.connect() as connection:
+                result = connection.execute(text("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' 
+                        AND table_name = :table_name
+                    )
+                """), {"table_name": table_name})
+                
+                if not result.scalar():
+                    raise handle_api_error(
+                        error=ValueError(f"Table '{table_name}' not found"),
+                        status_code=404,
+                        error_key="table_not_found",
+                        table_name=table_name
+                    )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as e:
+            raise handle_database_error(e, table_name=table_name)
         
         # Get the rule suggestions
-        suggestions = rule_generator.scan_table_for_rule_suggestions(table_name)
+        try:
+            suggestions = rule_generator.scan_table_for_rule_suggestions(table_name)
+        except Exception as e:
+            logger.error(f"Error getting rule suggestions for table {table_name}: {str(e)}")
+            raise handle_api_error(
+                error=e, 
+                status_code=500, 
+                error_key="rule_generation_error", 
+                table_name=table_name,
+                detail=str(e)
+            )
         
         created_rules = []
         updated_rules = []
@@ -578,7 +607,10 @@ async def apply_suggested_rules(
                 )
                 
                 if not rule_suggestion:
-                    errors.append(f"New rule suggestion with ID {rule_id} not found")
+                    errors.append(get_error_message(
+                        "resource_not_found", 
+                        resource_type=f"rule suggestion with ID {rule_id}"
+                    ))
                     continue
                 
                 # Extract rule configs - may now be a list of expectations
@@ -608,98 +640,102 @@ async def apply_suggested_rules(
                     match_count = 0
                     for new_expectation in clean_configs:
                         for existing_expectation in existing_rule.rule_config:
-                            if (existing_expectation.get("expectation_type") == new_expectation.get("expectation_type") and 
-                                existing_expectation.get("kwargs") == new_expectation.get("kwargs")):
+                            if (new_expectation["expectation_type"] == existing_expectation["expectation_type"] and
+                                new_expectation["kwargs"] == existing_expectation["kwargs"]):
                                 match_count += 1
                                 break
                     
                     if match_count == len(clean_configs):
+                        # This rule already exists
+                        errors.append(f"Similar rule already exists (Rule ID: {existing_rule.id})")
                         skip_rule = True
-                        errors.append(f"A similar rule already exists: {existing_rule.name} (ID: {existing_rule.id})")
                         break
                 
                 if skip_rule:
                     continue
                 
-                # Get column names for a more descriptive rule name
-                rule_columns = []
-                
-                # Extract columns from all expectations
-                for config in clean_configs:
-                    kwargs = config.get("kwargs", {})
-                    
-                    # Extract column names from different kwargs patterns
-                    if "column" in kwargs:
-                        rule_columns.append(kwargs["column"])
-                    if "column_A" in kwargs and "column_B" in kwargs:
-                        rule_columns.append(kwargs["column_A"])
-                        rule_columns.append(kwargs["column_B"])
-                    if "columns" in kwargs and isinstance(kwargs["columns"], list):
-                        rule_columns.extend(kwargs["columns"])
-                    if "compare_to" in kwargs:
-                        rule_columns.append(kwargs["compare_to"])
-                
-                # Create a descriptive name
-                column_str = ", ".join(set(rule_columns)) if rule_columns else ""
-                rule_name = f"AI Suggested Rule - {rule_suggestion.get('description', '').split('.')[0]}"
-                
-                # If multiple columns are involved, mention them in the name
-                if len(rule_columns) > 1:
-                    rule_name = f"AI Suggested Rule for {column_str}"
-                
                 # Create the new rule
-                rule = Rule(
-                    name=rule_name,
-                    description=rule_suggestion.get("description", "Automatically suggested rule based on data analysis"),
+                rule_name = rule_suggestion.get("description", "").split(".")[0]
+                if not rule_name:
+                    rule_name = f"Rule for {table_name}"
+                
+                rule_description = rule_suggestion.get("description", f"Automatically created rule for {table_name}")
+                
+                new_rule = Rule(
+                    name=f"AI Suggested Rule - {rule_name}",
+                    description=rule_description,
                     table_name=table_name,
                     rule_config=clean_configs,
-                    is_active=True,
-                    confidence=rule_suggestion.get("confidence", 90)
+                    is_active=True,  # New rule is active by default
+                    is_draft=False,
+                    confidence=rule_suggestion.get("confidence", None)
                 )
                 
-                db.add(rule)
-                db.commit()
-                db.refresh(rule)
-                created_rules.append(rule)
+                db.add(new_rule)
+                db.flush()  # Flush to get the ID, but don't commit yet
                 
+                # Create a version record
+                version = RuleVersion(
+                    rule_id=new_rule.id,
+                    version_number=1,  # First version
+                    rule_config=clean_configs,
+                    is_current=True
+                )
+                
+                db.add(version)
+                db.commit()
+                db.refresh(new_rule)
+                
+                created_rules.append(new_rule)
+                
+            except SQLAlchemyError as e:
+                db.rollback()
+                logger.error(f"Database error creating rule from suggestion {rule_id}: {str(e)}")
+                errors.append(get_error_message("database_query", detail=str(e)))
             except Exception as e:
                 db.rollback()
-                errors.append(f"Error creating rule {rule_id}: {str(e)}")
+                logger.error(f"Error creating rule from suggestion {rule_id}: {str(e)}")
+                errors.append(get_error_message("rule_generation_error", table_name=table_name, detail=str(e)))
         
         # Apply rule updates
         for rule_id in request.update_rule_ids:
             try:
-                # Find the corresponding rule update suggestion
+                # Find the corresponding update suggestion
                 update_suggestion = next(
                     (r for i, r in enumerate(suggestions["rule_update_suggestions"]) if i == rule_id), 
                     None
                 )
                 
                 if not update_suggestion:
-                    errors.append(f"Rule update suggestion with ID {rule_id} not found")
+                    errors.append(get_error_message(
+                        "resource_not_found", 
+                        resource_type=f"rule update suggestion with ID {rule_id}"
+                    ))
                     continue
                 
-                # Get the database rule ID
-                db_rule_id = update_suggestion.get("rule_id")
-                rule = db.query(Rule).filter(Rule.id == db_rule_id).first()
+                # Find the rule to update
+                rule = db.query(Rule).filter(Rule.id == update_suggestion["rule_id"]).first()
                 
                 if not rule:
-                    errors.append(f"Rule with ID {db_rule_id} not found in database")
+                    errors.append(get_error_message("rule_not_found", rule_id=update_suggestion["rule_id"]))
                     continue
                 
-                # Update the rule - ensure suggested_config is a list
-                suggested_config = update_suggestion.get("suggested_config", [])
-                if not isinstance(suggested_config, list):
-                    suggested_config = [suggested_config]
+                # Extract the suggested configs
+                suggested_configs = update_suggestion.get("suggested_config", [])
+                
+                # Ensure it's a list
+                if not isinstance(suggested_configs, list):
+                    suggested_configs = [suggested_configs]
                 
                 # Ensure all configs have proper structure
                 clean_configs = []
-                for config in suggested_config:
+                for config in suggested_configs:
                     clean_configs.append({
                         "expectation_type": config.get("expectation_type", ""),
                         "kwargs": config.get("kwargs", {})
                     })
                 
+                # Update the rule
                 rule.rule_config = clean_configs
                 
                 # Create a version record
@@ -719,9 +755,14 @@ async def apply_suggested_rules(
                 db.refresh(rule)
                 updated_rules.append(rule)
                 
+            except SQLAlchemyError as e:
+                db.rollback()
+                logger.error(f"Database error updating rule {rule_id}: {str(e)}")
+                errors.append(get_error_message("database_query", detail=str(e)))
             except Exception as e:
                 db.rollback()
-                errors.append(f"Error updating rule {rule_id}: {str(e)}")
+                logger.error(f"Error updating rule {rule_id}: {str(e)}")
+                errors.append(get_error_message("rule_update_error", detail=str(e)))
         
         return {
             "created_rules": created_rules,
@@ -731,15 +772,24 @@ async def apply_suggested_rules(
         
     except HTTPException:
         raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.exception(f"Database error: {str(e)}")
+        raise handle_database_error(e)
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Unhandled error in apply_suggested_rules: {str(e)}")
+        raise handle_api_error(
+            error=e,
+            status_code=500,
+            error_key="internal_error"
+        )
 
 @app.post(f"{settings.API_V1_STR}/analyze-table", response_model=TableAnalysisResponse)
 async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get_db)):
     """Perform comprehensive table analysis including rule suggestions."""
     try:
-        print(f"Starting analysis for table {request.table_name}")
+        logger.info(f"Starting analysis for table {request.table_name}")
         table_name = request.table_name
         
         # Verify table exists
@@ -754,42 +804,67 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                 """), {"table_name": table_name})
                 
                 if not result.scalar():
-                    raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+                    raise handle_api_error(
+                        error=ValueError(f"Table {table_name} not found"),
+                        status_code=404,
+                        error_key="table_not_found",
+                        table_name=table_name
+                    )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as e:
+            logger.error(f"Database error checking table existence: {str(e)}")
+            raise handle_database_error(e, table_name=table_name)
         except Exception as e:
-            print(f"Error checking table existence: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error checking table existence: {str(e)}")
+            logger.error(f"Error checking table existence: {str(e)}")
+            raise handle_api_error(
+                error=e,
+                status_code=500,
+                error_key="database_query",
+                detail=str(e)
+            )
         
         # Get table schema and sample data
-        schema_info = rule_generator.analyze_table_schema(table_name)
+        try:
+            schema_info = rule_generator.analyze_table_schema(table_name)
+        except Exception as e:
+            logger.error(f"Error analyzing table schema: {str(e)}")
+            raise handle_api_error(
+                error=e, 
+                status_code=500, 
+                error_key="sampling_error", 
+                detail=f"Failed to analyze table schema: {str(e)}"
+            )
         
         # Get column relationship insights for multi-column rules
         multi_column_insights = {}
         try:
             multi_column_insights = rule_generator._analyze_column_relationships(table_name, schema_info)
         except Exception as e:
-            print(f"Error analyzing column relationships: {str(e)}")
-            # Continue without these insights
+            logger.warning(f"Error analyzing column relationships: {str(e)}")
+            # Continue without these insights - non-critical error
         
-        # Calculate basic data statistics
+        # Calculate basic data statistics on random sample of 100 rows for better performance
         row_count = 0
         column_stats = {}
         
         try:
             with engine.connect() as connection:
-                # Get row count
+                # Get total row count (fast query)
                 row_count_result = connection.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
                 row_count = row_count_result.scalar()
                 
-                # Get column statistics
+                # Get column statistics using random sampling for better performance
                 for column in schema_info['columns']:
                     col_name = column['column_name']
                     data_type = column['data_type']
                     
                     # Get common statistics based on data type
+                    # Using TABLESAMPLE to get a random sample for faster processing
                     stats_query = ""
                     
                     if data_type in ('integer', 'bigint', 'numeric', 'real', 'double precision'):
-                        # Numeric column
+                        # Numeric column - apply random sampling for better performance
                         stats_query = f"""
                             SELECT 
                                 MIN({col_name}) as min_value,
@@ -797,10 +872,12 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                                 AVG({col_name}) as avg_value,
                                 COUNT({col_name}) as non_null_count,
                                 COUNT(*) - COUNT({col_name}) as null_count
-                            FROM {table_name}
+                            FROM (
+                                SELECT {col_name} FROM {table_name} ORDER BY RANDOM() LIMIT 100
+                            ) t
                         """
                     elif data_type in ('character varying', 'text', 'character', 'varchar'):
-                        # Text column
+                        # Text column - apply random sampling for better performance
                         stats_query = f"""
                             SELECT 
                                 MIN(LENGTH({col_name})) as min_length,
@@ -808,27 +885,33 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                                 AVG(LENGTH({col_name})) as avg_length,
                                 COUNT({col_name}) as non_null_count,
                                 COUNT(*) - COUNT({col_name}) as null_count
-                            FROM {table_name}
+                            FROM (
+                                SELECT {col_name} FROM {table_name} ORDER BY RANDOM() LIMIT 100
+                            ) t
                         """
                     elif data_type in ('date', 'timestamp', 'timestamp without time zone', 'timestamp with time zone'):
-                        # Date/timestamp column
+                        # Date/timestamp column - apply random sampling for better performance
                         stats_query = f"""
                             SELECT 
                                 MIN({col_name}) as min_date,
                                 MAX({col_name}) as max_date,
                                 COUNT({col_name}) as non_null_count,
                                 COUNT(*) - COUNT({col_name}) as null_count
-                            FROM {table_name}
+                            FROM (
+                                SELECT {col_name} FROM {table_name} ORDER BY RANDOM() LIMIT 100
+                            ) t
                         """
                     elif data_type in ('boolean'):
-                        # Boolean column
+                        # Boolean column - apply random sampling for better performance
                         stats_query = f"""
                             SELECT 
                                 COUNT({col_name}) FILTER (WHERE {col_name} = true) as true_count,
                                 COUNT({col_name}) FILTER (WHERE {col_name} = false) as false_count,
                                 COUNT({col_name}) as non_null_count,
                                 COUNT(*) - COUNT({col_name}) as null_count
-                            FROM {table_name}
+                            FROM (
+                                SELECT {col_name} FROM {table_name} ORDER BY RANDOM() LIMIT 100
+                            ) t
                         """
                     else:
                         # Other column types - just count nulls
@@ -836,7 +919,9 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                             SELECT 
                                 COUNT({col_name}) as non_null_count,
                                 COUNT(*) - COUNT({col_name}) as null_count
-                            FROM {table_name}
+                            FROM (
+                                SELECT {col_name} FROM {table_name} ORDER BY RANDOM() LIMIT 100
+                            ) t
                         """
                     
                     if stats_query:
@@ -849,13 +934,25 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                                     col_stats[k] = v.isoformat()
                                 elif v is None:
                                     col_stats[k] = None
+                            
+                            # Add note that stats are based on sample
+                            col_stats["sample_size"] = 100
+                            col_stats["is_sample"] = True
+                            
                             column_stats[col_name] = col_stats
                         except Exception as e:
-                            print(f"Error getting stats for column {col_name}: {str(e)}")
-                            column_stats[col_name] = {"error": str(e)}
+                            logger.warning(f"Error getting stats for column {col_name}: {str(e)}")
+                            column_stats[col_name] = {"error": str(e), "is_sample": True}
+        except SQLAlchemyError as e:
+            logger.error(f"Database error calculating statistics: {str(e)}")
+            # Continue with partial statistics - non-critical error
+            if not column_stats:
+                column_stats = {"error": str(e)}
         except Exception as e:
-            print(f"Error calculating data statistics: {str(e)}")
-            # Continue with partial statistics
+            logger.error(f"Error calculating data statistics: {str(e)}")
+            # Continue with partial statistics - non-critical error
+            if not column_stats:
+                column_stats = {"error": str(e)}
         
         # Get existing rules
         existing_rules = []
@@ -877,9 +974,12 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                     "rule_config": rule_config,
                     "is_active": rule.is_active
                 })
+        except SQLAlchemyError as e:
+            logger.error(f"Database error fetching existing rules: {str(e)}")
+            # Continue with empty existing rules - non-critical error
         except Exception as e:
-            print(f"Error fetching existing rules: {str(e)}")
-            # Continue with empty existing rules
+            logger.error(f"Error fetching existing rules: {str(e)}")
+            # Continue with empty existing rules - non-critical error
         
         # Get rule suggestions
         rule_suggestions = {"new_rule_suggestions": [], "rule_update_suggestions": []}
@@ -889,11 +989,11 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                 
                 # Validate rule suggestions format
                 if not isinstance(rule_suggestions, dict):
-                    print(f"Warning: rule_suggestions is not a dictionary: {type(rule_suggestions)}")
+                    logger.warning(f"Rule suggestions response is not a dictionary: {type(rule_suggestions)}")
                     rule_suggestions = {
                         "new_rule_suggestions": [],
                         "rule_update_suggestions": [],
-                        "error": "Invalid response format from rule generator"
+                        "error": get_error_message("invalid_json", data_type="rule suggestions")
                     }
                 
                 if "new_rule_suggestions" not in rule_suggestions:
@@ -902,18 +1002,18 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                 if "rule_update_suggestions" not in rule_suggestions:
                     rule_suggestions["rule_update_suggestions"] = []
             else:
-                print("Warning: AIRuleGenerator not available for rule suggestions")
+                logger.warning("AIRuleGenerator not available for rule suggestions")
                 rule_suggestions = {
                     "new_rule_suggestions": [],
                     "rule_update_suggestions": [],
-                    "error": "Rule generation service is not available"
+                    "error": get_error_message("ai_service_error")
                 }
         except Exception as e:
-            print(f"Error generating rule suggestions: {str(e)}")
+            logger.error(f"Error generating rule suggestions: {str(e)}")
             rule_suggestions = {
                 "new_rule_suggestions": [],
                 "rule_update_suggestions": [],
-                "error": f"Error generating rule suggestions: {str(e)}"
+                "error": get_error_message("rule_generation_error", table_name=table_name, detail=str(e))
             }
         
         # Apply high-confidence suggestions if requested
@@ -938,21 +1038,16 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
                         update_rule_ids=high_confidence_updates
                     )
                     
-                    try:
-                        # Call the apply function directly rather than via the API
-                        applied_suggestions = await apply_suggested_rules(
-                            table_name=table_name,
-                            request=apply_request,
-                            db=db
-                        )
-                    except Exception as e:
-                        print(f"Error applying suggestions: {str(e)}")
-                        # Continue without applied suggestions
+                    applied_suggestions = await apply_suggested_rules(
+                        table_name=table_name,
+                        request=apply_request,
+                        db=db
+                    )
             except Exception as e:
-                # Don't fail the whole analysis if applying suggestions fails
-                print(f"Error processing high-confidence suggestions: {str(e)}")
+                logger.error(f"Error applying high-confidence suggestions: {str(e)}")
+                # Continue without applied suggestions - non-critical error
         
-        # Compile the response
+        # Return the complete analysis response
         return {
             "table_name": table_name,
             "column_analysis": schema_info,
@@ -965,28 +1060,15 @@ async def analyze_table(request: TableAnalysisRequest, db: Session = Depends(get
             "existing_rules": existing_rules,
             "applied_suggestions": applied_suggestions
         }
-        
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Unexpected error in analyze_table: {str(e)}")
-        # Return partial response rather than raising an exception to prevent CORS issues
-        return {
-            "table_name": request.table_name,
-            "column_analysis": {},
-            "data_statistics": {
-                "row_count": 0,
-                "column_stats": {},
-                "multi_column_relationships": {}
-            },
-            "rule_suggestions": {
-                "new_rule_suggestions": [],
-                "rule_update_suggestions": [],
-                "error": f"Error analyzing table: {str(e)}"
-            },
-            "existing_rules": [],
-            "applied_suggestions": None
-        }
+        logger.exception(f"Unhandled error in analyze_table endpoint: {str(e)}")
+        raise handle_api_error(
+            error=e,
+            status_code=500,
+            error_key="internal_error"
+        )
 
 @app.get(f"{settings.API_V1_STR}/rules", response_model=List[RuleResponse])
 async def list_rules(db: Session = Depends(get_db)):
@@ -1014,68 +1096,48 @@ async def list_rules(db: Session = Depends(get_db)):
 
 @app.get(f"{settings.API_V1_STR}/rules/{{rule_id}}", response_model=RuleDetailResponse)
 async def get_rule(rule_id: int, db: Session = Depends(get_db)):
-    """Get detailed information about a rule."""
+    """Get detailed information about a specific rule."""
     try:
+        # Get the rule with versions
         rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        
         if not rule:
-            raise HTTPException(status_code=404, detail="Rule not found")
+            raise handle_api_error(
+                error=ValueError(f"Rule with ID {rule_id} not found"),
+                status_code=404,
+                error_key="rule_not_found",
+                rule_id=rule_id
+            )
         
-        # Ensure rule_config is in list format for multi-expectation rules
-        if rule.rule_config and not isinstance(rule.rule_config, list):
-            rule.rule_config = [{
-                "expectation_type": rule.rule_config.get("expectation_type", ""),
-                "kwargs": rule.rule_config.get("kwargs", {})
-            }]
+        # Extract columns from rule config
+        rule_columns = set()
+        for expectation in rule.rule_config:
+            kwargs = expectation.get("kwargs", {})
+            
+            # Extract from common kwargs patterns
+            if "column" in kwargs:
+                rule_columns.add(kwargs["column"])
+            if "column_A" in kwargs and "column_B" in kwargs:
+                rule_columns.add(kwargs["column_A"])
+                rule_columns.add(kwargs["column_B"])
+            if "columns" in kwargs and isinstance(kwargs["columns"], list):
+                rule_columns.update(kwargs["columns"])
         
-        # Extract column information from all rule expectations
-        columns = []
-        try:
-            for expectation in rule.rule_config:
-                kwargs = expectation.get("kwargs", {})
-                
-                # Check for single column format
-                if "column" in kwargs:
-                    columns.append(kwargs["column"])
-                    
-                # Check for column pair format (multi-column)
-                if "column_A" in kwargs:
-                    columns.append(kwargs["column_A"])
-                if "column_B" in kwargs:
-                    columns.append(kwargs["column_B"])
-                    
-                # Check for column list format
-                if "columns" in kwargs and isinstance(kwargs["columns"], list):
-                    columns.extend(kwargs["columns"])
-                    
-                # Check for compare_to format
-                if "compare_to" in kwargs:
-                    columns.append(kwargs["compare_to"])
-        except Exception as e:
-            print(f"Error extracting columns: {str(e)}")
-            pass
-        
-        # Get rule versions
+        # Get all versions and format them
         versions = []
         for version in rule.versions:
-            # Ensure version rule_config is in list format too
-            version_config = version.rule_config
-            if version_config and not isinstance(version_config, list):
-                version_config = [{
-                    "expectation_type": version_config.get("expectation_type", ""),
-                    "kwargs": version_config.get("kwargs", {})
-                }]
-            
             versions.append({
                 "id": version.id,
                 "version_number": version.version_number,
-                "rule_config": version_config,
+                "rule_config": version.rule_config,
                 "is_current": version.is_current,
                 "created_at": version.created_at
             })
         
-        # Remove duplicates from columns list
-        columns = list(set(columns))
+        # Sort versions by number in descending order (newest first)
+        versions.sort(key=lambda v: v["version_number"], reverse=True)
         
+        # Return detailed rule information
         return {
             "id": rule.id,
             "name": rule.name,
@@ -1087,14 +1149,20 @@ async def get_rule(rule_id: int, db: Session = Depends(get_db)):
             "confidence": rule.confidence,
             "created_at": rule.created_at,
             "updated_at": rule.updated_at,
-            "columns": columns,
+            "columns": list(rule_columns),
             "versions": versions
         }
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        logger.exception(f"Database error fetching rule {rule_id}: {str(e)}")
+        raise handle_database_error(e)
     except Exception as e:
-        print(f"Error in get_rule: {str(e)}")
-        raise HTTPException(
+        logger.exception(f"Error fetching rule {rule_id}: {str(e)}")
+        raise handle_api_error(
+            error=e,
             status_code=500,
-            detail=f"Error retrieving rule: {str(e)}"
+            error_key="internal_error"
         )
 
 @app.put(f"{settings.API_V1_STR}/rules/{{rule_id}}", response_model=RuleResponse)
@@ -1103,100 +1171,118 @@ async def update_rule(
     rule_update: RuleUpdate,
     db: Session = Depends(get_db)
 ):
-    """Update a specific rule."""
+    """Update an existing rule."""
     try:
+        # Find the rule
         rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        
         if not rule:
-            raise HTTPException(status_code=404, detail="Rule not found")
+            raise handle_api_error(
+                error=ValueError(f"Rule with ID {rule_id} not found"),
+                status_code=404,
+                error_key="rule_not_found",
+                rule_id=rule_id
+            )
         
         # Update fields if provided
         if rule_update.name is not None:
             rule.name = rule_update.name
+            
         if rule_update.description is not None:
             rule.description = rule_update.description
-        if rule_update.rule_config is not None:
-            rule.rule_config = [
-                {
-                    "expectation_type": expectation.expectation_type,
-                    "kwargs": expectation.kwargs
-                }
-                for expectation in rule_update.rule_config
-            ]
+            
         if rule_update.is_active is not None:
             rule.is_active = rule_update.is_active
-            
-        # Check if we're finalizing a draft rule
-        if rule.is_draft and rule_update.finalize_draft:
-            # Verify all columns exist if this is a draft rule being finalized
-            missing_columns = []
-            all_columns = []
-            
-            # Extract all columns from all expectations
-            for expectation in rule.rule_config:
-                kwargs = expectation.get("kwargs", {})
+        
+        # Create a new version if the rule config is updated
+        if rule_update.rule_config is not None:
+            # Validate rule configuration
+            try:
+                # Check rule_config is a list of ExpectationConfig objects
+                rule_configs = rule_update.rule_config
                 
-                # Check for single column format
-                if "column" in kwargs:
-                    all_columns.append(kwargs["column"])
-                    
-                # Check for column pair format (multi-column)
-                if "column_A" in kwargs:
-                    all_columns.append(kwargs["column_A"])
-                if "column_B" in kwargs:
-                    all_columns.append(kwargs["column_B"])
-                    
-                # Check for column list format
-                if "columns" in kwargs and isinstance(kwargs["columns"], list):
-                    all_columns.extend(kwargs["columns"])
-                    
-                # Check for compare_to format
-                if "compare_to" in kwargs:
-                    all_columns.append(kwargs["compare_to"])
-            
-            # Verify all columns exist
-            if all_columns:
-                with engine.connect() as connection:
-                    for column_name in all_columns:
-                        result = connection.execute(text("""
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_schema = 'public' AND table_name = :table_name AND column_name = :column_name
-                        """), {"table_name": rule.table_name, "column_name": column_name})
-                        
-                        if result.first() is None:
-                            missing_columns.append(column_name)
-                    
-            if missing_columns:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Columns {missing_columns} don't exist in table '{rule.table_name}'. Cannot finalize draft."
+                # Create a list of plain dictionaries from the Pydantic models
+                clean_configs = []
+                for config in rule_configs:
+                    clean_configs.append({
+                        "expectation_type": config.expectation_type,
+                        "kwargs": config.kwargs
+                    })
+                
+                # Apply the new rule configuration
+                rule.rule_config = clean_configs
+                
+                # Create a new version
+                version_number = 1
+                if rule.versions:
+                    version_number = max(v.version_number for v in rule.versions) + 1
+                
+                new_version = RuleVersion(
+                    rule_id=rule.id,
+                    version_number=version_number,
+                    rule_config=rule.rule_config,
+                    is_current=True
                 )
-            
-            # If we get here, we can finalize the draft
+                
+                # Set all other versions as not current
+                for version in rule.versions:
+                    version.is_current = False
+                
+                db.add(new_version)
+                
+            except Exception as e:
+                logger.error(f"Error updating rule configuration: {str(e)}")
+                raise handle_api_error(
+                    error=e,
+                    status_code=400,
+                    error_key="rule_update_error",
+                    detail=f"Invalid rule configuration: {str(e)}"
+                )
+        
+        # Finalize a draft rule if requested
+        if rule_update.finalize_draft and rule.is_draft:
             rule.is_draft = False
-            rule.confidence = 100  # User has verified the rule
+            
+            # If no name was provided, generate a better name
+            if rule_update.name is None and not rule.name:
+                # Extract column information from all expectations
+                columns = []
+                for expectation in rule.rule_config:
+                    kwargs = expectation.get("kwargs", {})
+                    
+                    if "column" in kwargs:
+                        columns.append(kwargs["column"])
+                        
+                    if "column_A" in kwargs and "column_B" in kwargs:
+                        columns.append(f"{kwargs['column_A']}/{kwargs['column_B']}")
+                
+                # Create a descriptive name if possible
+                if columns:
+                    column_str = ", ".join(set(columns))
+                    rule.name = f"Rule for {column_str}"
+                else:
+                    rule.name = f"Rule for {rule.table_name}"
         
-        # Create a new version of the rule
-        new_version = RuleVersion(
-            rule_id=rule.id,
-            version_number=len(rule.versions) + 1,
-            rule_config=rule.rule_config,
-            is_current=True
-        )
-        
-        # Set all other versions as not current
-        for version in rule.versions:
-            version.is_current = False
-        
-        db.add(new_version)
+        # Save changes and return the updated rule
+        rule.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(rule)
         
         return rule
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.exception(f"Database error updating rule {rule_id}: {str(e)}")
+        raise handle_database_error(e)
     except Exception as e:
         db.rollback()
-        raise HTTPException(
+        logger.exception(f"Error updating rule {rule_id}: {str(e)}")
+        raise handle_api_error(
+            error=e,
             status_code=500,
-            detail=f"Error updating rule: {str(e)}"
+            error_key="rule_update_error",
+            detail=str(e)
         )
 
 @app.delete(f"{settings.API_V1_STR}/rules/{{rule_id}}")

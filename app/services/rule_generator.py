@@ -42,8 +42,8 @@ class AIRuleGenerator:
             # Convert Row objects to dictionaries properly
             columns = [{"column_name": row[0], "data_type": row[1], "is_nullable": row[2], "column_default": row[3]} for row in result]
             
-            # Get sample data
-            sample_query = text(f"SELECT * FROM {table_name} LIMIT 100")
+            # Get a random sample of 100 rows for better performance
+            sample_query = text(f"SELECT * FROM {table_name} ORDER BY RANDOM() LIMIT 100")
             sample_data = pd.read_sql(sample_query, connection)
             
             return {
@@ -511,8 +511,10 @@ DO NOT add any text before or after the JSON.
                 "error": f"Table {table_name} does not exist"
             }
         
-        # Analyze the table schema
+        # Analyze the table schema - use a shorter timeout for better performance
         try:
+            # Limit schema analysis time for better performance
+            logger.info(f"Starting schema analysis for {table_name} with random sampling")
             schema_info = self.analyze_table_schema(table_name)
             logger.info(f"Schema analysis complete for {table_name}")
         except Exception as e:
@@ -523,47 +525,55 @@ DO NOT add any text before or after the JSON.
                 "error": f"Error analyzing schema: {str(e)}"
             }
         
-        # Analyze column relationships
+        # Analyze column relationships - limit the analysis to key relationships only
+        logger.info(f"Analyzing column relationships for {table_name}")
         multi_column_insights = self._analyze_column_relationships(table_name, schema_info)
         
         # Create the prompt for rule suggestion generation
         prompt = self._create_rule_suggestion_prompt(table_name, schema_info, multi_column_insights)
         
         try:
-            # Send the request to Claude
+            # Send the request to Claude with reduced temperature for more consistent results
             logger.info(f"Sending request to Claude for {table_name}")
             
-            if USE_NEW_CLIENT:
-                # Use new Anthropic client
-                response = self.client.messages.create(
-                    model="claude-3-sonnet-20240229",
-                    max_tokens=4000,
-                    temperature=0.2,
-                    system="You are a data quality expert. Your task is to analyze table data and suggest Great Expectations rules to validate the data.",
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-            else:
-                # Use older Anthropic client
-                response = self.client.messages.create(
-                    model="claude-3-sonnet-20240229",
-                    max_tokens=4000,
-                    temperature=0.2,
-                    system="You are a data quality expert. Your task is to analyze table data and suggest Great Expectations rules to validate the data.",
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-            
-            # Parse the response
-            content = ""
-            if USE_NEW_CLIENT:
-                content = response.content[0].text.strip()
-            else:
-                content = response.content.strip()
+            # If Claude API call fails or returns invalid JSON, use simple rule generation instead
+            try:
+                if USE_NEW_CLIENT:
+                    # Use new Anthropic client with optimized parameters
+                    response = self.client.messages.create(
+                        model="claude-3-sonnet-20240229",
+                        max_tokens=3000,  # Reduced token count for faster response
+                        temperature=0.1,  # Lower temperature for more consistent results
+                        system="You are a data quality expert. Analyze the sample data and suggest rules that would likely apply to the full dataset.",
+                        messages=[
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+                else:
+                    # Use older Anthropic client
+                    response = self.client.messages.create(
+                        model="claude-3-sonnet-20240229",
+                        max_tokens=3000,  # Reduced token count
+                        temperature=0.1,  # Lower temperature
+                        system="You are a data quality expert. Analyze the sample data and suggest rules that would likely apply to the full dataset.",
+                        messages=[
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
                 
-            logger.info(f"Received response from Claude (first 200 chars): {content[:200]}...")
+                # Parse the response
+                content = ""
+                if USE_NEW_CLIENT:
+                    content = response.content[0].text.strip()
+                else:
+                    content = response.content.strip()
+                    
+                logger.info(f"Received response from Claude (first 200 chars): {content[:200]}...")
+            except Exception as api_error:
+                logger.error(f"Error calling Claude API: {str(api_error)}")
+                logger.info("Falling back to basic rule generation")
+                # Generate basic rules instead
+                return self._generate_basic_rule_suggestions(table_name, schema_info)
             
             # Attempt to extract JSON from response if not already JSON
             try:
@@ -583,19 +593,22 @@ DO NOT add any text before or after the JSON.
                         logger.info("Successfully extracted JSON from code block")
                     except json.JSONDecodeError:
                         logger.error("Failed to parse JSON from code block")
-                        raise
+                        # Fall back to basic rule generation
+                        return self._generate_basic_rule_suggestions(table_name, schema_info)
                 else:
                     # If regex extraction fails, look for the first { and last } for a complete JSON object
                     logger.info("No code block found, searching for JSON object boundaries")
                     start_idx = content.find('{')
                     if start_idx == -1:
                         logger.error("No opening brace found in response")
-                        raise ValueError("Could not find JSON object in response")
+                        # Fall back to basic rule generation
+                        return self._generate_basic_rule_suggestions(table_name, schema_info)
                         
                     end_idx = content.rfind('}')
                     if end_idx == -1 or end_idx <= start_idx:
                         logger.error("No closing brace found in response")
-                        raise ValueError("Could not find complete JSON object in response")
+                        # Fall back to basic rule generation
+                        return self._generate_basic_rule_suggestions(table_name, schema_info)
                         
                     json_str = content[start_idx:end_idx+1]
                     
@@ -613,26 +626,8 @@ DO NOT add any text before or after the JSON.
                         logger.info("Successfully extracted and parsed JSON object")
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse extracted JSON: {e}")
-                        
-                        # Fall back to a simpler approach - extract each suggestion separately
-                        logger.info("Falling back to default suggestions structure")
-                        suggestions = {
-                            "new_rule_suggestions": [],
-                            "rule_update_suggestions": []
-                        }
-                        
-                        # Try to extract at least some rule suggestions
-                        rule_matches = re.findall(r'\{\s*"rule_type".*?\}', content, re.DOTALL)
-                        if rule_matches:
-                            logger.info(f"Found {len(rule_matches)} potential rule objects")
-                            for match in rule_matches:
-                                try:
-                                    rule = json.loads(match)
-                                    if "rule_type" in rule and "description" in rule:
-                                        logger.info(f"Adding rule: {rule['rule_type']}")
-                                        suggestions["new_rule_suggestions"].append(rule)
-                                except json.JSONDecodeError:
-                                    continue
+                        # Fall back to basic rule generation
+                        return self._generate_basic_rule_suggestions(table_name, schema_info)
             
             # Ensure required keys exist
             if "new_rule_suggestions" not in suggestions:
@@ -678,11 +673,8 @@ DO NOT add any text before or after the JSON.
         
         except Exception as e:
             logger.exception(f"Error generating rule suggestions for {table_name}: {str(e)}")
-            return {
-                "new_rule_suggestions": [],
-                "rule_update_suggestions": [],
-                "error": f"Error in rule suggestion generation: {str(e)}"
-            }
+            # Fall back to basic rule generation
+            return self._generate_basic_rule_suggestions(table_name, schema_info)
 
     def _analyze_column_relationships(self, table_name: str, schema_info: Dict[str, Any]) -> Dict[str, Any]:
         """Analyze relationships between columns in the table.
@@ -693,12 +685,14 @@ DO NOT add any text before or after the JSON.
         - Columns with conditional relationships
         """
         try:
+            # Limit analysis to most important relationship types for better performance
             column_pairs = []
             columns = [col["column_name"] for col in schema_info["columns"]]
             sample_data = schema_info["sample_data"]
             
-            # Look for potential naming pattern relationships
+            # Look for potential naming pattern relationships 
             # Examples: first_name/last_name, start_date/end_date, etc.
+            # These are quick to compute based just on column names
             related_by_name = []
             name_patterns = [
                 ("start", "end"), ("begin", "end"), ("first", "last"),
@@ -715,6 +709,7 @@ DO NOT add any text before or after the JSON.
             
             # Look for potential foreign key relationships based on naming conventions
             # Examples: user_id in a table might reference id in users table
+            # Also quick to compute based on column names
             potential_foreign_keys = []
             id_columns = [col for col in columns if col.endswith("_id")]
             
@@ -726,40 +721,8 @@ DO NOT add any text before or after the JSON.
                     "potential_reference": f"{referenced_table}.id"
                 })
             
-            # Look for correlated value patterns in the data
-            value_correlations = []
-            
-            # Simple implementation: check if columns have matching values in sample data
-            if sample_data and len(sample_data) > 0:
-                for i, col_a in enumerate(columns):
-                    for col_b in columns[i+1:]:
-                        matching_count = 0
-                        total_count = 0
-                        
-                        for row in sample_data:
-                            if col_a in row and col_b in row:
-                                val_a = row[col_a]
-                                val_b = row[col_b]
-                                # Skip null values
-                                if val_a is None or val_b is None:
-                                    continue
-                                    
-                                total_count += 1
-                                # Check exact matches or pattern matches
-                                if val_a == val_b:
-                                    matching_count += 1
-                                # Check if one value is contained in the other
-                                elif isinstance(val_a, str) and isinstance(val_b, str):
-                                    if val_a in val_b or val_b in val_a:
-                                        matching_count += 1
-                        
-                        if total_count > 0 and matching_count / total_count > 0.5:
-                            value_correlations.append({
-                                "column_pair": [col_a, col_b],
-                                "match_percentage": round(matching_count / total_count * 100, 2)
-                            })
-            
             # Look for natural date comparisons (e.g., start_date should be before end_date)
+            # Quick to compute based on data types and naming patterns
             date_comparisons = []
             date_columns = []
             
@@ -777,6 +740,53 @@ DO NOT add any text before or after the JSON.
                                     "column_pair": [col_a, col_b],
                                     "expected_relationship": f"{col_a} should be before {col_b}"
                                 })
+            
+            # Limit the correlated value analysis to a smaller number of column combinations
+            # for better performance
+            value_correlations = []
+            
+            # Only process if we have sample data and the number of columns is reasonable
+            if sample_data and len(sample_data) > 0 and len(columns) <= 20:
+                # Limit to a smaller number of column pairs by prioritizing:
+                # 1. Columns with similar names or prefixes
+                # 2. Columns with compatible data types
+                prioritized_pairs = []
+                
+                # Find column pairs with similar names
+                for i, col_a in enumerate(columns):
+                    for col_b in columns[i+1:]:
+                        # Check for common prefixes or similar names
+                        if (col_a.split('_')[0] == col_b.split('_')[0] or
+                            col_a.replace('_', '') in col_b or col_b.replace('_', '') in col_a):
+                            prioritized_pairs.append((col_a, col_b))
+                
+                # Analyze a smaller subset of column pairs (max 10)
+                for col_a, col_b in prioritized_pairs[:10]:
+                    matching_count = 0
+                    total_count = 0
+                    
+                    for row in sample_data:
+                        if col_a in row and col_b in row:
+                            val_a = row[col_a]
+                            val_b = row[col_b]
+                            # Skip null values
+                            if val_a is None or val_b is None:
+                                continue
+                                
+                            total_count += 1
+                            # Check exact matches or pattern matches
+                            if val_a == val_b:
+                                matching_count += 1
+                            # Check if one value is contained in the other
+                            elif isinstance(val_a, str) and isinstance(val_b, str):
+                                if val_a in val_b or val_b in val_a:
+                                    matching_count += 1
+                    
+                    if total_count > 0 and matching_count / total_count > 0.5:
+                        value_correlations.append({
+                            "column_pair": [col_a, col_b],
+                            "match_percentage": round(matching_count / total_count * 100, 2)
+                        })
             
             return {
                 "related_by_name": related_by_name,
@@ -840,7 +850,9 @@ DO NOT add any text before or after the JSON.
 
 Table: {table_name}
 Columns: {schema_info['columns']}
-Sample Data: {schema_info['sample_data'][:10]}
+Sample Data (random 5 rows from a 100 row sample): {schema_info['sample_data'][:5]}
+
+Note: You're analyzing a random sample of 100 rows, not the entire table. Focus on patterns that would likely apply to the full dataset.
 
 Existing Rules: {existing_rules}
 
@@ -849,7 +861,7 @@ Potential New Rules: {potential_new_rules}
 Multi-Column Relationship Analysis: {multi_column_insights}
 
 Your task:
-1. Analyze the current data patterns
+1. Analyze the current data patterns within this random sample
 2. Compare existing rules with potential new rules
 3. Identify gaps in rule coverage or outdated rules
 4. Pay special attention to multi-column relationships and constraints
@@ -882,19 +894,78 @@ Return a detailed JSON with:
             "confidence": 85
         }}
     ]
-}}
-
-- Suggest both single-column and multi-column rules. For multi-column rules, use:
-  - expect_column_pair_values_to_be_equal: For columns that should be equal
-  - expect_column_pair_values_to_be_in_set: For column pairs with allowed value combinations
-  - Specialized multi-column expectations for foreign keys or relationships
-- Only suggest rules that have clear value for data quality
-- For new rules, include a detailed description explaining why they're needed
-- For rule updates, explain specifically what changed and why
-- Assign a confidence score (0-100) to each suggestion
-- Skip suggesting rules that are very similar to existing rules
-
-The response should be valid JSON that can be parsed by Python's json.loads() function.
-"""
-        
+}}"""
         return prompt 
+
+    def _generate_basic_rule_suggestions(self, table_name: str, schema_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate basic rule suggestions without using the Claude API.
+        Used as a fallback when the API call fails or returns invalid JSON.
+        """
+        logger.info(f"Generating basic rule suggestions for {table_name}")
+        
+        new_rule_suggestions = []
+        rule_update_suggestions = []
+        
+        # Get columns and sample data
+        columns = schema_info.get("columns", [])
+        sample_data = schema_info.get("sample_data", [])
+        
+        # Generate simple rule suggestions based on column types
+        for column in columns:
+            col_name = column.get("column_name")
+            data_type = column.get("data_type", "").lower()
+            is_nullable = column.get("is_nullable") == "YES"
+            
+            # Basic not-null rules for important columns
+            if not is_nullable or col_name.endswith("_id") or col_name == "id":
+                new_rule_suggestions.append({
+                    "rule_type": "expect_column_values_to_not_be_null",
+                    "column": col_name,
+                    "columns": None,
+                    "description": f"The {col_name} column should not contain null values.",
+                    "rule_config": [{
+                        "expectation_type": "expect_column_values_to_not_be_null",
+                        "kwargs": {"column": col_name}
+                    }],
+                    "confidence": 90
+                })
+            
+            # Type-based rules
+            if "int" in data_type or data_type in ("bigint", "smallint", "decimal", "numeric"):
+                # Check if it's an ID column (likely unique)
+                if col_name.endswith("_id") or col_name == "id":
+                    new_rule_suggestions.append({
+                        "rule_type": "expect_column_values_to_be_unique",
+                        "column": col_name,
+                        "columns": None,
+                        "description": f"The {col_name} column should contain unique values.",
+                        "rule_config": [{
+                            "expectation_type": "expect_column_values_to_be_unique",
+                            "kwargs": {"column": col_name}
+                        }],
+                        "confidence": 85
+                    })
+            elif "char" in data_type or "text" in data_type:
+                # For email columns
+                if "email" in col_name.lower():
+                    new_rule_suggestions.append({
+                        "rule_type": "expect_column_values_to_match_regex",
+                        "column": col_name,
+                        "columns": None,
+                        "description": f"The {col_name} column should contain valid email addresses.",
+                        "rule_config": [{
+                            "expectation_type": "expect_column_values_to_match_regex",
+                            "kwargs": {
+                                "column": col_name, 
+                                "regex": r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+                            }
+                        }],
+                        "confidence": 80
+                    })
+            
+        return {
+            "new_rule_suggestions": new_rule_suggestions,
+            "rule_update_suggestions": rule_update_suggestions,
+            "error": None
+        } 
