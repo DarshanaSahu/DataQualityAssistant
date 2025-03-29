@@ -1,12 +1,31 @@
+import json
+import re
+import logging
 import pandas as pd
+import numpy as np
 from sqlalchemy import create_engine, text
-import anthropic
+
+try:
+    # Try importing from the latest Anthropic client version
+    from anthropic import Anthropic
+    USE_NEW_CLIENT = True
+except ImportError:
+    # Fall back to the older client if needed
+    import anthropic
+    USE_NEW_CLIENT = False
+
 from app.core.config import settings
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple, Union
+from app.services import db_utils
+
+logger = logging.getLogger(__name__)
 
 class AIRuleGenerator:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        if USE_NEW_CLIENT:
+            self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        else:
+            self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         self.engine = create_engine(settings.DATABASE_URL)
 
     def analyze_table_schema(self, table_name: str) -> Dict[str, Any]:
@@ -36,7 +55,10 @@ class AIRuleGenerator:
         """Generate Great Expectations rules using Claude."""
         schema_info = self.analyze_table_schema(table_name)
         
-        # Prepare prompt for Claude
+        # First identify potential column relationships
+        multi_column_insights = self._analyze_column_relationships(table_name, schema_info)
+        
+        # Prepare prompt for Claude with enhanced multi-column support
         prompt = f"""You are a data quality expert specializing in Great Expectations rules generation.
         Analyze the following PostgreSQL table schema and sample data to generate appropriate Great Expectations rules.
         Focus on data quality aspects like:
@@ -45,12 +67,17 @@ class AIRuleGenerator:
         - Value ranges and distributions
         - Uniqueness
         - Referential integrity
+        - Multi-column relationships and constraints
         
         Table: {table_name}
         Columns: {schema_info['columns']}
         Sample Data: {schema_info['sample_data'][:5]}  # First 5 rows
         
-        Generate rules in Great Expectations format. Each rule should be a dictionary with the following structure:
+        Multi-Column Relationship Analysis: {multi_column_insights}
+        
+        Generate rules in Great Expectations format. Include both single-column rules and multi-column rules.
+        
+        SINGLE-COLUMN RULE EXAMPLE:
         {{
             "expectation_type": "expect_column_values_to_not_be_null",
             "kwargs": {{
@@ -59,7 +86,38 @@ class AIRuleGenerator:
             }}
         }}
         
-        Return as a list of such rule configurations. Make sure the response is valid JSON that can be parsed by Python's json.loads() function.
+        MULTI-COLUMN RULE EXAMPLES:
+        
+        1. Column Pair Equality:
+        {{
+            "expectation_type": "expect_column_pair_values_to_be_equal",
+            "kwargs": {{
+                "column_A": "first_column",
+                "column_B": "second_column"
+            }}
+        }}
+        
+        2. Column Pair Valid Combinations:
+        {{
+            "expectation_type": "expect_column_pair_values_to_be_in_set",
+            "kwargs": {{
+                "column_A": "country",
+                "column_B": "currency",
+                "value_pairs_set": [["USA", "USD"], ["Canada", "CAD"]]
+            }}
+        }}
+        
+        3. Date Column Ordering:
+        {{
+            "expectation_type": "expect_column_values_to_be_greater_than_other_column",
+            "kwargs": {{
+                "column": "end_date",
+                "compare_to": "start_date"
+            }}
+        }}
+        
+        Return as a list of such rule configurations. Include a mix of single-column and multi-column rules as appropriate.
+        Make sure the response is valid JSON that can be parsed by Python's json.loads() function.
         """
         
         response = self.client.messages.create(
@@ -97,13 +155,41 @@ class AIRuleGenerator:
                 if formatted_rule["expectation_type"] and formatted_rule["kwargs"]:
                     formatted_rules.append(formatted_rule)
             
-            return formatted_rules if formatted_rules else [{
-                "expectation_type": "expect_column_values_to_not_be_null",
-                "kwargs": {
-                    "column": schema_info['columns'][0]['column_name'],
-                    "mostly": 0.95
-                }
-            }]
+            # If no valid rules were found, provide a default rule
+            if not formatted_rules:
+                # Try to include both a single-column and a multi-column rule if possible
+                default_rules = []
+                
+                # Add a default single-column rule
+                if schema_info['columns']:
+                    default_rules.append({
+                        "expectation_type": "expect_column_values_to_not_be_null",
+                        "kwargs": {
+                            "column": schema_info['columns'][0]['column_name'],
+                            "mostly": 0.95
+                        }
+                    })
+                
+                # Add a default multi-column rule if possible
+                if len(schema_info['columns']) >= 2:
+                    default_rules.append({
+                        "expectation_type": "expect_column_pair_values_to_be_in_set",
+                        "kwargs": {
+                            "column_A": schema_info['columns'][0]['column_name'],
+                            "column_B": schema_info['columns'][1]['column_name'],
+                            "value_pairs_set": []
+                        }
+                    })
+                
+                return default_rules if default_rules else [{
+                    "expectation_type": "expect_column_values_to_not_be_null",
+                    "kwargs": {
+                        "column": schema_info['columns'][0]['column_name'],
+                        "mostly": 0.95
+                    }
+                }]
+                
+            return formatted_rules
             
         except Exception as e:
             print(f"Error parsing rules: {str(e)}")
@@ -174,8 +260,8 @@ class AIRuleGenerator:
         """Generate a rule from natural language description."""
         schema_info = self.analyze_table_schema(table_name)
         
-        # Even simpler format - direct instructional prompt with fixed structure
-        prompt = """You are a data quality expert. Generate a single Great Expectations rule based on this description.
+        # Updated prompt that supports multi-column rules
+        prompt = """You are a data quality expert. Generate a Great Expectations rule based on this description.
 
 Table: {table}
 Columns: {columns}
@@ -183,11 +269,22 @@ Sample Data: {sample_data}
 Rule Description: "{description}"
 
 Your task is to:
-1. Identify what column and validation the rule applies to
+1. Identify what column(s) and validation the rule applies to
 2. Choose the most appropriate expectation type
 3. Return ONLY a JSON object, nothing else
 
-ONLY return this JSON structure:
+IMPORTANT: If the rule involves MULTIPLE COLUMNS, use appropriate multi-column expectations 
+or return MULTIPLE single-column expectations as an array.
+
+For multi-column rules, use any of these approaches as appropriate:
+1. Use "expect_column_pair_values_to_be_in_set" for column pair validations
+2. Use "expect_column_pair_values_to_be_equal" for equality checks between columns
+3. Use "expect_column_values_to_be_in_set" with dynamic value sets based on another column
+4. For complex relationships, return multiple related rules in an array
+
+ONLY return a JSON structure like ONE of these:
+
+SINGLE COLUMN EXPECTATION:
 {{
   "expectation_type": "expect_column_values_to_not_be_null",
   "kwargs": {{ 
@@ -196,8 +293,35 @@ ONLY return this JSON structure:
   "confidence": 90
 }}
 
-Set confidence (0-100) based on how confident you are in this rule. Respond only when the rule is above 90% confident.
-Include ONLY required parameters in kwargs.
+MULTI-COLUMN EXPECTATION:
+{{
+  "expectation_type": "expect_column_pair_values_to_be_in_set",
+  "kwargs": {{ 
+    "column_A": "first_column",
+    "column_B": "second_column",
+    "value_pairs_set": [["value1_A", "value1_B"], ["value2_A", "value2_B"]]
+  }},
+  "confidence": 90
+}}
+
+MULTI-RULE RESPONSE (for complex validations):
+[
+  {{
+    "expectation_type": "expect_column_values_to_not_be_null",
+    "kwargs": {{ "column": "first_column" }},
+    "confidence": 90
+  }},
+  {{
+    "expectation_type": "expect_column_values_to_be_in_set",
+    "kwargs": {{ 
+      "column": "second_column",
+      "value_set": ["value1", "value2"]
+    }},
+    "confidence": 85
+  }}
+]
+
+Set confidence (0-100) based on how confident you are in this rule. Include ONLY required parameters in kwargs.
 DO NOT add any text before or after the JSON.
 """
         
@@ -235,7 +359,7 @@ DO NOT add any text before or after the JSON.
                 rule_data = json.loads(content)
             except json.JSONDecodeError:
                 # If that fails, use regex to extract the JSON object
-                pattern = r'(\{[\s\S]*\})'
+                pattern = r'(\{[\s\S]*\}|\[[\s\S]*\])'  # Match either object or array
                 matches = re.findall(pattern, content)
                 
                 if not matches:
@@ -248,7 +372,9 @@ DO NOT add any text before or after the JSON.
                     try:
                         rule_data = json.loads(match)
                         # Verify it's a valid rule structure
-                        if "expectation_type" in rule_data and "kwargs" in rule_data:
+                        if isinstance(rule_data, dict) and "expectation_type" in rule_data and "kwargs" in rule_data:
+                            break
+                        elif isinstance(rule_data, list) and all("expectation_type" in r and "kwargs" in r for r in rule_data):
                             break
                     except json.JSONDecodeError:
                         continue
@@ -256,14 +382,28 @@ DO NOT add any text before or after the JSON.
                 if not rule_data:
                     raise ValueError("No valid rule configuration found")
             
-            # Create a clean rule structure
-            rule = {
-                "expectation_type": rule_data.get("expectation_type", ""),
-                "kwargs": rule_data.get("kwargs", {}),
-                "confidence": rule_data.get("confidence", 0)
-            }
+            # Handle both single rule and multiple rules
+            if isinstance(rule_data, dict):
+                # Single rule
+                rule = {
+                    "expectation_type": rule_data.get("expectation_type", ""),
+                    "kwargs": rule_data.get("kwargs", {}),
+                    "confidence": rule_data.get("confidence", 0)
+                }
+                return [rule]
+            elif isinstance(rule_data, list):
+                # Multiple rules
+                rules = []
+                for r in rule_data:
+                    rule = {
+                        "expectation_type": r.get("expectation_type", ""),
+                        "kwargs": r.get("kwargs", {}),
+                        "confidence": r.get("confidence", 0)
+                    }
+                    rules.append(rule)
+                return rules
                 
-            return [rule]
+            return [rule_data]  # Fallback
             
         except Exception as e:
             print(f"Error parsing rule: {str(e)}")
@@ -277,16 +417,30 @@ DO NOT add any text before or after the JSON.
         rule_description_lower = rule_description.lower()
         columns = schema_info['columns']
         
-        # Try to identify the most mentioned column
-        mentioned_column = None
+        # Try to identify mentioned columns
+        mentioned_columns = []
         for col in columns:
-            if col["column_name"].lower() in rule_description_lower:
-                mentioned_column = col["column_name"]
-                break
+            col_name = col["column_name"].lower()
+            if col_name in rule_description_lower:
+                mentioned_columns.append(col["column_name"])
         
-        # If no column mentioned, use the first column
-        if not mentioned_column and columns:
-            mentioned_column = columns[0]["column_name"]
+        # If no columns mentioned, use the first column
+        if not mentioned_columns and columns:
+            mentioned_columns.append(columns[0]["column_name"])
+        
+        # For multi-column rules
+        if len(mentioned_columns) > 1 and any(term in rule_description_lower for term in ['equal', 'same', 'match between', 'comparison', 'equals', 'equivalent']):
+            return {
+                "expectation_type": "expect_column_pair_values_to_be_equal",
+                "kwargs": {
+                    "column_A": mentioned_columns[0],
+                    "column_B": mentioned_columns[1]
+                },
+                "confidence": 40
+            }
+        
+        # Use the first mentioned column for single-column rules
+        mentioned_column = mentioned_columns[0] if mentioned_columns else columns[0]["column_name"]
         
         # Use heuristics to guess the appropriate rule type
         if any(term in rule_description_lower for term in ['unique', 'duplicate']):
@@ -339,4 +493,408 @@ DO NOT add any text before or after the JSON.
                 "expectation_type": "expect_column_values_to_not_be_null",
                 "kwargs": {"column": mentioned_column, "mostly": 0.95},
                 "confidence": 30
+            }
+
+    def scan_table_for_rule_suggestions(self, table_name: str) -> Dict[str, Any]:
+        """
+        Analyze a table and suggest data quality rules based on patterns found.
+        Returns suggested new rules and updates to existing rules.
+        """
+        logger.info(f"Scanning table {table_name} for rule suggestions")
+        
+        # Make sure table exists
+        if not db_utils.table_exists(table_name):
+            logger.error(f"Table {table_name} does not exist")
+            return {
+                "new_rule_suggestions": [],
+                "rule_update_suggestions": [],
+                "error": f"Table {table_name} does not exist"
+            }
+        
+        # Analyze the table schema
+        try:
+            schema_info = self.analyze_table_schema(table_name)
+            logger.info(f"Schema analysis complete for {table_name}")
+        except Exception as e:
+            logger.exception(f"Error analyzing schema for table {table_name}: {str(e)}")
+            return {
+                "new_rule_suggestions": [],
+                "rule_update_suggestions": [],
+                "error": f"Error analyzing schema: {str(e)}"
+            }
+        
+        # Analyze column relationships
+        multi_column_insights = self._analyze_column_relationships(table_name, schema_info)
+        
+        # Create the prompt for rule suggestion generation
+        prompt = self._create_rule_suggestion_prompt(table_name, schema_info, multi_column_insights)
+        
+        try:
+            # Send the request to Claude
+            logger.info(f"Sending request to Claude for {table_name}")
+            
+            if USE_NEW_CLIENT:
+                # Use new Anthropic client
+                response = self.client.messages.create(
+                    model="claude-3-sonnet-20240229",
+                    max_tokens=4000,
+                    temperature=0.2,
+                    system="You are a data quality expert. Your task is to analyze table data and suggest Great Expectations rules to validate the data.",
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+            else:
+                # Use older Anthropic client
+                response = self.client.messages.create(
+                    model="claude-3-sonnet-20240229",
+                    max_tokens=4000,
+                    temperature=0.2,
+                    system="You are a data quality expert. Your task is to analyze table data and suggest Great Expectations rules to validate the data.",
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+            
+            # Parse the response
+            content = ""
+            if USE_NEW_CLIENT:
+                content = response.content[0].text.strip()
+            else:
+                content = response.content.strip()
+                
+            logger.info(f"Received response from Claude (first 200 chars): {content[:200]}...")
+            
+            # Attempt to extract JSON from response if not already JSON
+            try:
+                # Try parsing directly first
+                suggestions = json.loads(content)
+            except json.JSONDecodeError as decode_error:
+                # If direct parsing fails, try to extract JSON using regex
+                logger.error(f"JSON decode error at position {decode_error.pos}, line {decode_error.lineno}, column {decode_error.colno}")
+                logger.info("Direct JSON parsing failed, trying to extract JSON...")
+                
+                # First try with code block format
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                    try:
+                        suggestions = json.loads(json_str)
+                        logger.info("Successfully extracted JSON from code block")
+                    except json.JSONDecodeError:
+                        logger.error("Failed to parse JSON from code block")
+                        raise
+                else:
+                    # If regex extraction fails, look for the first { and last } for a complete JSON object
+                    logger.info("No code block found, searching for JSON object boundaries")
+                    start_idx = content.find('{')
+                    if start_idx == -1:
+                        logger.error("No opening brace found in response")
+                        raise ValueError("Could not find JSON object in response")
+                        
+                    end_idx = content.rfind('}')
+                    if end_idx == -1 or end_idx <= start_idx:
+                        logger.error("No closing brace found in response")
+                        raise ValueError("Could not find complete JSON object in response")
+                        
+                    json_str = content[start_idx:end_idx+1]
+                    
+                    # Try to clean up the JSON
+                    # Remove any trailing commas before closing braces or brackets
+                    json_str = re.sub(r',\s*}', '}', json_str)
+                    json_str = re.sub(r',\s*]', ']', json_str)
+                    
+                    # Fix any single quoted strings if needed
+                    json_str = re.sub(r'\'([^\']+)\'', r'"\1"', json_str)
+                    
+                    logger.info(f"Extracted JSON string (first 200 chars): {json_str[:200]}...")
+                    try:
+                        suggestions = json.loads(json_str)
+                        logger.info("Successfully extracted and parsed JSON object")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse extracted JSON: {e}")
+                        
+                        # Fall back to a simpler approach - extract each suggestion separately
+                        logger.info("Falling back to default suggestions structure")
+                        suggestions = {
+                            "new_rule_suggestions": [],
+                            "rule_update_suggestions": []
+                        }
+                        
+                        # Try to extract at least some rule suggestions
+                        rule_matches = re.findall(r'\{\s*"rule_type".*?\}', content, re.DOTALL)
+                        if rule_matches:
+                            logger.info(f"Found {len(rule_matches)} potential rule objects")
+                            for match in rule_matches:
+                                try:
+                                    rule = json.loads(match)
+                                    if "rule_type" in rule and "description" in rule:
+                                        logger.info(f"Adding rule: {rule['rule_type']}")
+                                        suggestions["new_rule_suggestions"].append(rule)
+                                except json.JSONDecodeError:
+                                    continue
+            
+            # Ensure required keys exist
+            if "new_rule_suggestions" not in suggestions:
+                suggestions["new_rule_suggestions"] = []
+            
+            if "rule_update_suggestions" not in suggestions:
+                suggestions["rule_update_suggestions"] = []
+            
+            # Ensure all rule configs are lists
+            for rule in suggestions.get("new_rule_suggestions", []):
+                if "rule_config" in rule and not isinstance(rule["rule_config"], list):
+                    rule["rule_config"] = [rule["rule_config"]]
+            
+            # Ensure all suggested configs are lists
+            for rule in suggestions.get("rule_update_suggestions", []):
+                if "suggested_config" in rule and not isinstance(rule["suggested_config"], list):
+                    rule["suggested_config"] = [rule["suggested_config"]]
+                    
+                # Make sure rule_id is an integer
+                if "rule_id" in rule and not isinstance(rule["rule_id"], int):
+                    try:
+                        rule["rule_id"] = int(rule["rule_id"])
+                    except (ValueError, TypeError):
+                        # If it can't be converted to an integer, remove the suggestion
+                        logger.error(f"Invalid rule_id: {rule.get('rule_id')}")
+                        suggestions["rule_update_suggestions"].remove(rule)
+                        continue
+                
+                # Handle special case for current_config
+                if "current_config" in rule and isinstance(rule["current_config"], str):
+                    try:
+                        # Try to parse it as JSON
+                        config = json.loads(rule["current_config"])
+                        if isinstance(config, dict):
+                            rule["current_config"] = [config]
+                        elif isinstance(config, list):
+                            rule["current_config"] = config
+                    except json.JSONDecodeError:
+                        # If it's not valid JSON, treat it as a string description
+                        pass
+            
+            return suggestions
+        
+        except Exception as e:
+            logger.exception(f"Error generating rule suggestions for {table_name}: {str(e)}")
+            return {
+                "new_rule_suggestions": [],
+                "rule_update_suggestions": [],
+                "error": f"Error in rule suggestion generation: {str(e)}"
+            }
+
+    def _analyze_column_relationships(self, table_name: str, schema_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze relationships between columns in the table.
+        
+        This helps identify potential multi-column rules like:
+        - Foreign key relationships
+        - Column pairs that should match or be related
+        - Columns with conditional relationships
+        """
+        try:
+            column_pairs = []
+            columns = [col["column_name"] for col in schema_info["columns"]]
+            sample_data = schema_info["sample_data"]
+            
+            # Look for potential naming pattern relationships
+            # Examples: first_name/last_name, start_date/end_date, etc.
+            related_by_name = []
+            name_patterns = [
+                ("start", "end"), ("begin", "end"), ("first", "last"),
+                ("min", "max"), ("source", "target"), ("from", "to")
+            ]
+            
+            for pattern_a, pattern_b in name_patterns:
+                for col_a in columns:
+                    if pattern_a in col_a.lower():
+                        base_name = col_a.lower().replace(pattern_a, "")
+                        for col_b in columns:
+                            if pattern_b in col_b.lower() and base_name in col_b.lower():
+                                related_by_name.append((col_a, col_b))
+            
+            # Look for potential foreign key relationships based on naming conventions
+            # Examples: user_id in a table might reference id in users table
+            potential_foreign_keys = []
+            id_columns = [col for col in columns if col.endswith("_id")]
+            
+            for id_col in id_columns:
+                # The referenced table name might be the prefix of the _id column
+                referenced_table = id_col.replace("_id", "")
+                potential_foreign_keys.append({
+                    "column": id_col,
+                    "potential_reference": f"{referenced_table}.id"
+                })
+            
+            # Look for correlated value patterns in the data
+            value_correlations = []
+            
+            # Simple implementation: check if columns have matching values in sample data
+            if sample_data and len(sample_data) > 0:
+                for i, col_a in enumerate(columns):
+                    for col_b in columns[i+1:]:
+                        matching_count = 0
+                        total_count = 0
+                        
+                        for row in sample_data:
+                            if col_a in row and col_b in row:
+                                val_a = row[col_a]
+                                val_b = row[col_b]
+                                # Skip null values
+                                if val_a is None or val_b is None:
+                                    continue
+                                    
+                                total_count += 1
+                                # Check exact matches or pattern matches
+                                if val_a == val_b:
+                                    matching_count += 1
+                                # Check if one value is contained in the other
+                                elif isinstance(val_a, str) and isinstance(val_b, str):
+                                    if val_a in val_b or val_b in val_a:
+                                        matching_count += 1
+                        
+                        if total_count > 0 and matching_count / total_count > 0.5:
+                            value_correlations.append({
+                                "column_pair": [col_a, col_b],
+                                "match_percentage": round(matching_count / total_count * 100, 2)
+                            })
+            
+            # Look for natural date comparisons (e.g., start_date should be before end_date)
+            date_comparisons = []
+            date_columns = []
+            
+            for col in schema_info["columns"]:
+                if col["data_type"] in ("date", "timestamp", "timestamp without time zone", "timestamp with time zone"):
+                    date_columns.append(col["column_name"])
+            
+            # Find pairs of date columns that might have a chronological relationship
+            for date_pattern_a, date_pattern_b in [("start", "end"), ("begin", "end"), ("from", "to")]:
+                for col_a in date_columns:
+                    if date_pattern_a in col_a.lower():
+                        for col_b in date_columns:
+                            if date_pattern_b in col_b.lower() and col_a != col_b:
+                                date_comparisons.append({
+                                    "column_pair": [col_a, col_b],
+                                    "expected_relationship": f"{col_a} should be before {col_b}"
+                                })
+            
+            return {
+                "related_by_name": related_by_name,
+                "potential_foreign_keys": potential_foreign_keys,
+                "value_correlations": value_correlations,
+                "date_comparisons": date_comparisons
+            }
+        
+        except Exception as e:
+            print(f"Error analyzing column relationships: {str(e)}")
+            return {
+                "error": str(e),
+                "related_by_name": [],
+                "potential_foreign_keys": [],
+                "value_correlations": [],
+                "date_comparisons": []
             } 
+
+    def _create_rule_suggestion_prompt(self, table_name: str, schema_info: Dict[str, Any], 
+                                       multi_column_insights: Dict[str, Any]) -> str:
+        """
+        Create a detailed prompt for rule suggestion generation.
+        
+        Args:
+            table_name: Name of the table being analyzed
+            schema_info: Dictionary with table schema information
+            multi_column_insights: Dictionary with multi-column relationship insights
+            
+        Returns:
+            String prompt for Claude to generate rule suggestions
+        """
+        # Get existing rules for this table
+        existing_rules = []
+        try:
+            with self.engine.connect() as connection:
+                query = text("""
+                    SELECT id, name, rule_config::text
+                    FROM rules
+                    WHERE table_name = :table_name
+                    AND is_active = true
+                """)
+                result = connection.execute(query, {"table_name": table_name})
+                existing_rules = [
+                    {"id": row[0], "name": row[1], "rule_config": row[2]} 
+                    for row in result
+                ]
+        except Exception as e:
+            logger.error(f"Error fetching existing rules: {str(e)}")
+            # Continue with empty existing rules
+        
+        # Generate potential new rules based on current data
+        potential_new_rules = []
+        try:
+            potential_new_rules = self.generate_rules(table_name)
+        except Exception as e:
+            logger.error(f"Error generating potential rules: {str(e)}")
+            # Continue with empty potential rules
+
+        # Prepare a complete analysis prompt
+        prompt = f"""You are a data quality expert analyzing table data and existing rules.
+
+Table: {table_name}
+Columns: {schema_info['columns']}
+Sample Data: {schema_info['sample_data'][:10]}
+
+Existing Rules: {existing_rules}
+
+Potential New Rules: {potential_new_rules}
+
+Multi-Column Relationship Analysis: {multi_column_insights}
+
+Your task:
+1. Analyze the current data patterns
+2. Compare existing rules with potential new rules
+3. Identify gaps in rule coverage or outdated rules
+4. Pay special attention to multi-column relationships and constraints
+
+Return a detailed JSON with:
+
+{{
+    "new_rule_suggestions": [
+        {{
+            "rule_type": "expectation_type",
+            "column": "column_name",  // For single-column rules
+            "columns": ["column1", "column2"],  // For multi-column rules
+            "description": "Human readable description of why this rule is suggested",
+            "rule_config": {{
+                "expectation_type": "expect_column_values_to_not_be_null",
+                "kwargs": {{ "column": "column_name" }}
+            }},
+            "confidence": 90
+        }}
+    ],
+    "rule_update_suggestions": [
+        {{
+            "rule_id": 123,
+            "current_config": "existing rule config",
+            "suggested_config": {{
+                "expectation_type": "expect_column_values_to_not_be_null",
+                "kwargs": {{ "column": "column_name", "mostly": 0.95 }}
+            }},
+            "reason": "Human readable explanation of why this update is suggested",
+            "confidence": 85
+        }}
+    ]
+}}
+
+- Suggest both single-column and multi-column rules. For multi-column rules, use:
+  - expect_column_pair_values_to_be_equal: For columns that should be equal
+  - expect_column_pair_values_to_be_in_set: For column pairs with allowed value combinations
+  - Specialized multi-column expectations for foreign keys or relationships
+- Only suggest rules that have clear value for data quality
+- For new rules, include a detailed description explaining why they're needed
+- For rule updates, explain specifically what changed and why
+- Assign a confidence score (0-100) to each suggestion
+- Skip suggesting rules that are very similar to existing rules
+
+The response should be valid JSON that can be parsed by Python's json.loads() function.
+"""
+        
+        return prompt 
