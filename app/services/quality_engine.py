@@ -525,21 +525,167 @@ class DataQualityEngine:
                     
                     # Add specific result details based on what's available
                     for key, value in validation_result.items():
-                        if key not in ["expectation_type", "success"]:
+                        if key not in ["expectation_type", "success", "sample_rows"]:
                             # Format lists and dicts as JSON strings with safe serialization
                             if isinstance(value, (list, dict)):
                                 value = json.dumps(value, default=json_serialize_safe)
                             data[key] = value
                     
                     detailed_data.append(data)
+                    
+        # Extract sample failed rows for separate sheet
+        sample_rows_data = []
+        for result in execution_results["results"]:
+            if "results" in result:
+                for validation_result in result["results"]:
+                    if not validation_result.get("success", True) and validation_result.get("sample_rows"):
+                        for sample_row in validation_result.get("sample_rows", []):
+                            # Convert sample row to a flattened format
+                            row_data = {
+                                "Rule ID": result["rule_id"],
+                                "Rule Name": result["rule_name"],
+                                "Expectation Type": validation_result.get("expectation_type", ""),
+                            }
+                            
+                            # Add the row details
+                            if isinstance(sample_row, dict):
+                                # Add all row values
+                                for key, value in sample_row.items():
+                                    # Handle nested dictionaries
+                                    if isinstance(value, dict):
+                                        for sub_key, sub_value in value.items():
+                                            row_data[f"{key}_{sub_key}"] = sub_value
+                                    else:
+                                        row_data[key] = value
+                            
+                            sample_rows_data.append(row_data)
+                                                
+        # Create visualization data for charts
+        rule_success_data = {
+            "Rule Name": [result["rule_name"] for result in execution_results["results"]],
+            "Success": [1 if result["success"] else 0 for result in execution_results["results"]]
+        }
         
         # Create Excel writer
-        with pd.ExcelWriter(output_path) as writer:
-            pd.DataFrame(overall_summary).to_excel(writer, sheet_name="Overall Summary", index=False)
-            pd.DataFrame(rules_summary).to_excel(writer, sheet_name="Rules Summary", index=False)
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            # Overall Summary Sheet
+            summary_df = pd.DataFrame(overall_summary)
+            summary_df.to_excel(writer, sheet_name="Overall Summary", index=False)
             
+            # Apply formatting to the overall summary sheet
+            workbook = writer.book
+            summary_sheet = writer.sheets["Overall Summary"]
+            
+            # Add title
+            title_format = workbook.add_format({'bold': True, 'font_size': 14})
+            summary_sheet.write(0, 0, f"Data Quality Report for {execution_results['table_name']}", title_format)
+            summary_sheet.write(1, 0, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            summary_sheet.write(3, 0, "Overall Summary:")
+            
+            # Write the summary data with offset
+            summary_df.to_excel(writer, sheet_name="Overall Summary", startrow=4, index=False)
+            
+            # Format headers
+            header_format = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
+            for col_num, value in enumerate(summary_df.columns.values):
+                summary_sheet.write(4, col_num, value, header_format)
+            
+            # Format the success rate with color coding
+            success_rate = execution_results["success_rate"]
+            cell_format = workbook.add_format()
+            if success_rate >= 90:
+                cell_format.set_bg_color('#C6EFCE')  # Green for good
+            elif success_rate >= 70:
+                cell_format.set_bg_color('#FFEB9C')  # Yellow for warning
+            else:
+                cell_format.set_bg_color('#FFC7CE')  # Red for bad
+            
+            # Find the success rate column index
+            success_rate_col = summary_df.columns.get_loc("Success Rate (%)")
+            summary_sheet.write(5, success_rate_col, success_rate, cell_format)
+            
+            # Rules Summary Sheet
+            rules_df = pd.DataFrame(rules_summary)
+            rules_df.to_excel(writer, sheet_name="Rules Summary", index=False)
+            
+            # Format the Rules Summary sheet
+            rules_sheet = writer.sheets["Rules Summary"]
+            for col_num, value in enumerate(rules_df.columns.values):
+                rules_sheet.write(0, col_num, value, header_format)
+                
+            # Color code the status column
+            status_col = rules_df.columns.get_loc("Status")
+            for row_num, status in enumerate(rules_df["Status"]):
+                if status == "Success":
+                    cell_format = workbook.add_format({'bg_color': '#C6EFCE'})
+                else:
+                    cell_format = workbook.add_format({'bg_color': '#FFC7CE'})
+                rules_sheet.write(row_num + 1, status_col, status, cell_format)
+            
+            # Detailed Results sheet
             if detailed_data:
-                pd.DataFrame(detailed_data).to_excel(writer, sheet_name="Detailed Results", index=False)
+                detail_df = pd.DataFrame(detailed_data)
+                detail_df.to_excel(writer, sheet_name="Detailed Results", index=False)
+                
+                # Format the Detailed Results sheet
+                detail_sheet = writer.sheets["Detailed Results"]
+                for col_num, value in enumerate(detail_df.columns.values):
+                    detail_sheet.write(0, col_num, value, header_format)
+                
+                # Color code the success column
+                success_col = detail_df.columns.get_loc("Success")
+                for row_num, success in enumerate(detail_df["Success"]):
+                    if success:
+                        cell_format = workbook.add_format({'bg_color': '#C6EFCE'})
+                    else:
+                        cell_format = workbook.add_format({'bg_color': '#FFC7CE'})
+                    detail_sheet.write(row_num + 1, success_col, success, cell_format)
             else:
                 # Create an empty sheet if no detailed data
-                pd.DataFrame().to_excel(writer, sheet_name="Detailed Results", index=False) 
+                pd.DataFrame().to_excel(writer, sheet_name="Detailed Results", index=False)
+            
+            # Sample Failed Rows sheet
+            if sample_rows_data:
+                # Create a DataFrame from the sample rows
+                sample_df = pd.DataFrame(sample_rows_data)
+                sample_df.to_excel(writer, sheet_name="Failed Data Samples", index=False)
+                
+                # Format the Sample Failed Rows sheet
+                sample_sheet = writer.sheets["Failed Data Samples"]
+                for col_num, value in enumerate(sample_df.columns.values):
+                    sample_sheet.write(0, col_num, value, header_format)
+            
+            # Data Quality Metrics Visualization
+            metrics_data = []
+            for result in execution_results["results"]:
+                if "statistics" in result:
+                    stats = result["statistics"]
+                    metrics_data.append({
+                        "Rule Name": result["rule_name"],
+                        "Total Rows": stats.get("total_rows", 0),
+                        "Pass Rate (%)": (stats.get("successful_expectations", 0) / 
+                                        max(stats.get("evaluated_expectations", 1), 1)) * 100
+                    })
+            
+            if metrics_data:
+                metrics_df = pd.DataFrame(metrics_data)
+                metrics_df.to_excel(writer, sheet_name="Quality Metrics", index=False)
+                
+                # Format the Metrics sheet
+                metrics_sheet = writer.sheets["Quality Metrics"]
+                for col_num, value in enumerate(metrics_df.columns.values):
+                    metrics_sheet.write(0, col_num, value, header_format)
+                
+                # Add a bar chart to visualize pass rates
+                chart = workbook.add_chart({'type': 'bar'})
+                chart.add_series({
+                    'name': 'Pass Rate (%)',
+                    'categories': ['Quality Metrics', 1, 0, len(metrics_data), 0],
+                    'values': ['Quality Metrics', 1, 2, len(metrics_data), 2],
+                })
+                chart.set_title({'name': 'Data Quality Pass Rate by Rule'})
+                chart.set_y_axis({'name': 'Rule'})
+                chart.set_x_axis({'name': 'Pass Rate (%)'})
+                metrics_sheet.insert_chart('E2', chart, {'x_scale': 1.5, 'y_scale': 2})
+        
+        return output_path 
