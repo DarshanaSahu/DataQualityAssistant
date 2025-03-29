@@ -174,36 +174,49 @@ class AIRuleGenerator:
         """Generate a rule from natural language description."""
         schema_info = self.analyze_table_schema(table_name)
         
-        # Prepare prompt for Claude
-        prompt = f"""You are a data quality expert specializing in Great Expectations rules generation.
-        Based on the following natural language description, generate an appropriate Great Expectations rule.
+        # Even simpler format - direct instructional prompt with fixed structure
+        prompt = """You are a data quality expert. Generate a single Great Expectations rule based on this description.
+
+Table: {table}
+Columns: {columns}
+Sample Data: {sample_data}
+Rule Description: "{description}"
+
+Your task is to:
+1. Identify what column and validation the rule applies to
+2. Choose the most appropriate expectation type
+3. Return ONLY a JSON object, nothing else
+
+ONLY return this JSON structure:
+{{
+  "expectation_type": "expect_column_values_to_not_be_null",
+  "kwargs": {{ 
+    "column": "column_name" 
+  }},
+  "confidence": 90
+}}
+
+Set confidence (0-100) based on how confident you are in this rule. Respond only when the rule is above 90% confident.
+Include ONLY required parameters in kwargs.
+DO NOT add any text before or after the JSON.
+"""
         
-        Table: {table_name}
-        Columns: {schema_info['columns']}
-        Sample Data: {schema_info['sample_data'][:5]}  # First 5 rows
-        Rule Description: {rule_description}
-        
-        Generate a rule in Great Expectations format that matches the described requirement.
-        The rule should be a dictionary with the following structure:
-        {{
-            "expectation_type": "appropriate_expectation_type",
-            "kwargs": {{
-                "column": "column_name",
-                "other_parameters": "as_needed"
-            }}
-        }}
-        
-        Return as a list containing a single rule configuration. Make sure the response is valid JSON that can be parsed by Python's json.loads() function.
-        """
+        # Format the prompt safely with actual values
+        formatted_prompt = prompt.format(
+            table=table_name,
+            columns=schema_info['columns'],
+            sample_data=schema_info['sample_data'][:5],
+            description=rule_description
+        )
         
         response = self.client.messages.create(
             model="claude-3-sonnet-20240229",
             max_tokens=4000,
-            temperature=0.7,
+            temperature=0.5, # Reduced temperature for more consistent results
             messages=[
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": formatted_prompt
                 }
             ]
         )
@@ -211,41 +224,119 @@ class AIRuleGenerator:
         # Parse and validate the generated rule
         try:
             import json
-            rules = json.loads(response.content[0].text)
-            if not isinstance(rules, list):
-                rules = [rules]
+            import re
             
-            # Validate and format the rule
-            formatted_rules = []
-            for rule in rules:
-                if not isinstance(rule, dict):
-                    continue
-                    
-                # Ensure the rule has the required structure
-                formatted_rule = {
-                    "expectation_type": rule.get("expectation_type", ""),
-                    "kwargs": rule.get("kwargs", {})
-                }
+            # Extract JSON from the response
+            content = response.content[0].text.strip()
+            print(f"Claude response: {content}")  # Debug output
+            
+            try:
+                # First try direct JSON parsing
+                rule_data = json.loads(content)
+            except json.JSONDecodeError:
+                # If that fails, use regex to extract the JSON object
+                pattern = r'(\{[\s\S]*\})'
+                matches = re.findall(pattern, content)
                 
-                # Only add valid rules
-                if formatted_rule["expectation_type"] and formatted_rule["kwargs"]:
-                    formatted_rules.append(formatted_rule)
+                if not matches:
+                    raise ValueError("No JSON found in Claude's response")
+                    
+                # Try to parse each match until we find a valid one
+                rule_data = None
+                
+                for match in matches:
+                    try:
+                        rule_data = json.loads(match)
+                        # Verify it's a valid rule structure
+                        if "expectation_type" in rule_data and "kwargs" in rule_data:
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                        
+                if not rule_data:
+                    raise ValueError("No valid rule configuration found")
             
-            return formatted_rules if formatted_rules else [{
-                "expectation_type": "expect_column_values_to_not_be_null",
-                "kwargs": {
-                    "column": schema_info['columns'][0]['column_name'],
-                    "mostly": 0.95
-                }
-            }]
+            # Create a clean rule structure
+            rule = {
+                "expectation_type": rule_data.get("expectation_type", ""),
+                "kwargs": rule_data.get("kwargs", {}),
+                "confidence": rule_data.get("confidence", 0)
+            }
+                
+            return [rule]
             
         except Exception as e:
             print(f"Error parsing rule: {str(e)}")
-            # Return a default rule if parsing fails
-            return [{
+            print(f"Original response: {response.content[0].text}")
+            # Create a fallback rule
+            fallback_rule = self._create_fallback_rule(rule_description, schema_info)
+            return [fallback_rule]
+            
+    def _create_fallback_rule(self, rule_description: str, schema_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a fallback rule based on simple analysis of the rule description."""
+        rule_description_lower = rule_description.lower()
+        columns = schema_info['columns']
+        
+        # Try to identify the most mentioned column
+        mentioned_column = None
+        for col in columns:
+            if col["column_name"].lower() in rule_description_lower:
+                mentioned_column = col["column_name"]
+                break
+        
+        # If no column mentioned, use the first column
+        if not mentioned_column and columns:
+            mentioned_column = columns[0]["column_name"]
+        
+        # Use heuristics to guess the appropriate rule type
+        if any(term in rule_description_lower for term in ['unique', 'duplicate']):
+            return {
+                "expectation_type": "expect_column_values_to_be_unique",
+                "kwargs": {"column": mentioned_column},
+                "confidence": 50
+            }
+        elif any(term in rule_description_lower for term in ['null', 'missing', 'empty', 'required']):
+            return {
                 "expectation_type": "expect_column_values_to_not_be_null",
-                "kwargs": {
-                    "column": schema_info['columns'][0]['column_name'],
-                    "mostly": 0.95
+                "kwargs": {"column": mentioned_column, "mostly": 0.95},
+                "confidence": 60
+            }
+        elif any(term in rule_description_lower for term in ['between', 'range', 'minimum', 'maximum']):
+            # Try to extract numbers from the description
+            import re
+            numbers = re.findall(r'\d+(?:\.\d+)?', rule_description)
+            if len(numbers) >= 2:
+                return {
+                    "expectation_type": "expect_column_values_to_be_between",
+                    "kwargs": {
+                        "column": mentioned_column,
+                        "min_value": float(numbers[0]),
+                        "max_value": float(numbers[1])
+                    },
+                    "confidence": 55
                 }
-            }] 
+            else:
+                return {
+                    "expectation_type": "expect_column_values_to_be_between",
+                    "kwargs": {"column": mentioned_column},
+                    "confidence": 40
+                }
+        elif any(term in rule_description_lower for term in ['match', 'pattern', 'regex', 'expression']):
+            return {
+                "expectation_type": "expect_column_values_to_match_regex",
+                "kwargs": {"column": mentioned_column, "regex": ".*"},
+                "confidence": 45
+            }
+        elif any(term in rule_description_lower for term in ['in set', 'value', 'allowed', 'list', 'valid']):
+            return {
+                "expectation_type": "expect_column_values_to_be_in_set",
+                "kwargs": {"column": mentioned_column, "value_set": []},
+                "confidence": 45
+            }
+        else:
+            # Default fallback
+            return {
+                "expectation_type": "expect_column_values_to_not_be_null",
+                "kwargs": {"column": mentioned_column, "mostly": 0.95},
+                "confidence": 30
+            } 

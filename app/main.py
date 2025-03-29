@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 import uvicorn
 from app.core.config import settings
 from app.db.session import get_db, engine
@@ -11,6 +11,7 @@ from app.models.rule import Rule, RuleVersion
 from pydantic import BaseModel
 import os
 from sqlalchemy import text, inspect, cast, String, JSON
+from datetime import datetime
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -65,6 +66,8 @@ class RuleResponse(BaseModel):
     table_name: str
     rule_config: dict
     is_active: bool
+    is_draft: bool = False
+    confidence: int | None = None
 
     class Config:
         from_attributes = True
@@ -82,12 +85,30 @@ class RuleExecutionResponse(BaseModel):
     failed_rules: int
     success_rate: float
     results: List[dict]
+    
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda v: v.isoformat(),
+            # Handle numpy.bool_ and other numpy types
+            'numpy.bool_': lambda v: bool(v),
+            'numpy.integer': lambda v: int(v),
+            'numpy.floating': lambda v: float(v),
+            'numpy.ndarray': lambda v: v.tolist()
+        }
 
 class RuleUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     rule_config: dict | None = None
     is_active: bool | None = None
+    finalize_draft: bool = False  # Option to finalize a draft rule
+
+class RuleClarificationResponse(BaseModel):
+    rule_config: dict
+    needs_clarification: bool
+    clarification_questions: List[str]
+    confidence: int | None = None
 
 # Initialize services
 try:
@@ -172,7 +193,41 @@ async def check_rule_outdated(rule_id: int, db: Session = Depends(get_db)):
 async def execute_rules(request: RuleExecutionRequest):
     """Execute specified rules against a table."""
     try:
+        # Execute rules and get results
         results = quality_engine.execute_rules(request.table_name, request.rule_ids)
+        
+        # Ensure all numpy types are converted to Python native types
+        def sanitize_numpy_types(obj):
+            if isinstance(obj, dict):
+                return {k: sanitize_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [sanitize_numpy_types(item) for item in obj]
+            elif str(type(obj)).startswith("<class 'numpy."):
+                # Convert numpy types to native Python types
+                if hasattr(obj, 'item'):
+                    return obj.item()  # Convert numpy scalars to Python scalars
+                elif hasattr(obj, 'tolist'):
+                    return obj.tolist()  # Convert numpy arrays to lists
+                else:
+                    return str(obj)  # Fallback to string conversion
+            else:
+                return obj
+                
+        # Apply the sanitization to the entire results
+        results = sanitize_numpy_types(results)
+        
+        # Verify and ensure all validations with unexpected data have sample rows
+        for rule_result in results.get("results", []):
+            validations = rule_result.get("results", [])
+            for validation in validations:
+                # Check if there are unexpected values in this validation
+                unexpected_count = validation.get("result", {}).get("unexpected_count", 0)
+                # If there are unexpected values, ensure we have sample rows regardless of success
+                if unexpected_count > 0:
+                    # Ensure sample_rows exists and is not empty if we have unexpected data
+                    if not validation.get("sample_rows"):
+                        print(f"Warning: Validation has {unexpected_count} unexpected values but no sample rows")
+                        validation["sample_rows"] = []  # Placeholder empty array
         
         # Generate report
         report_dir = "reports"
@@ -224,6 +279,28 @@ async def update_rule(
             rule.rule_config = rule_update.rule_config
         if rule_update.is_active is not None:
             rule.is_active = rule_update.is_active
+            
+        # Check if we're finalizing a draft rule
+        if rule.is_draft and rule_update.finalize_draft:
+            # Verify column exists if this is a draft rule being finalized
+            column_name = rule.rule_config.get("kwargs", {}).get("column")
+            if column_name:
+                with engine.connect() as connection:
+                    result = connection.execute(text("""
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = :table_name AND column_name = :column_name
+                    """), {"table_name": rule.table_name, "column_name": column_name})
+                    column_exists = result.first() is not None
+                    
+                if not column_exists:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Column '{column_name}' doesn't exist in table '{rule.table_name}'. Cannot finalize draft."
+                    )
+            
+            # If we get here, we can finalize the draft
+            rule.is_draft = False
+            rule.confidence = 100  # User has verified the rule
         
         # Create a new version of the rule
         new_version = RuleVersion(
@@ -380,54 +457,177 @@ async def generate_rule_from_description(
     db: Session = Depends(get_db)
 ):
     """Generate a rule from natural language description."""
-    # try:
+    try:
+        # Basic input validation
+        if not rule_data.rule_description:
+            raise HTTPException(
+                status_code=400,
+                detail="Rule description cannot be empty"
+            )
+            
+        # Check if table exists
+        table_exists = False
+        try:
+            with engine.connect() as connection:
+                result = connection.execute(text("""
+                    SELECT 1 FROM information_schema.tables 
+                    WHERE table_schema = 'public' AND table_name = :table_name
+                """), {"table_name": rule_data.table_name})
+                table_exists = result.first() is not None
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error checking table existence: {str(e)}"
+            )
+            
+        if not table_exists:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Table '{rule_data.table_name}' does not exist"
+            )
+            
         # Generate rule using the rule generator
-    rules = rule_generator.generate_rule_from_description(
-        table_name=rule_data.table_name,
-        rule_description=rule_data.rule_description
-    )
-    
-    if not rules:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not generate valid rule from description"
+        rules = rule_generator.generate_rule_from_description(
+            table_name=rule_data.table_name,
+            rule_description=rule_data.rule_description
         )
-    
-    rule_config = rules[0]
-    
-    # Check if a similar rule already exists
-    existing_rule = db.query(Rule).filter(
-        Rule.table_name == rule_data.table_name,
-        cast(Rule.rule_config['expectation_type'], String) == rule_config.get("expectation_type", ""),
-        cast(Rule.rule_config['kwargs'], String) == str(rule_config.get("kwargs", {}))
-    ).first()
-    
-    if existing_rule:
-        raise HTTPException(
-            status_code=400,
-            detail="A similar rule already exists for this table"
+        
+        if not rules:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not generate valid rule from description"
+            )
+        
+        rule_config = rules[0]
+        confidence = rule_config.get("confidence", 0)
+        
+        # Enhanced check for column existence in rule
+        column_name = rule_config.get("kwargs", {}).get("column")
+        column_exists = True
+        if column_name:
+            # Verify the column exists in the table
+            with engine.connect() as connection:
+                result = connection.execute(text("""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = :table_name AND column_name = :column_name
+                """), {"table_name": rule_data.table_name, "column_name": column_name})
+                column_exists = result.first() is not None
+        
+        # Determine if the rule should be in draft mode
+        # Rules are in draft if: column doesn't exist, confidence is low, or other parameters are missing
+        is_draft = False
+        if not column_exists or confidence < 70:
+            is_draft = True
+        
+        # For columns that don't exist, save in draft mode
+        if not column_exists:
+            print(f"Warning: Column '{column_name}' doesn't exist in table '{rule_data.table_name}'. Saving as draft.")
+        
+        # Check if a similar rule already exists
+        existing_rule = db.query(Rule).filter(
+            Rule.table_name == rule_data.table_name,
+            cast(Rule.rule_config['expectation_type'], String) == rule_config.get("expectation_type", ""),
+            cast(Rule.rule_config['kwargs'], String) == str(rule_config.get("kwargs", {}))
+        ).first()
+        
+        if existing_rule:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A similar rule already exists: {existing_rule.name} (ID: {existing_rule.id})"
+            )
+        
+        # Create the rule in database - exclude the confidence metadata
+        clean_rule_config = {
+            "expectation_type": rule_config.get("expectation_type", ""),
+            "kwargs": rule_config.get("kwargs", {})
+        }
+        
+        rule = Rule(
+            name=rule_data.rule_name or f"Rule for {rule_data.table_name}: {clean_rule_config.get('expectation_type', '')}",
+            description=rule_data.rule_description,
+            table_name=rule_data.table_name,
+            rule_config=clean_rule_config,
+            is_active=True,
+            is_draft=is_draft,
+            confidence=confidence
         )
-    
-    # Create the rule in database
-    rule = Rule(
-        name=rule_data.rule_name,
-        description=rule_data.rule_description,
-        table_name=rule_data.table_name,
-        rule_config=rule_config,
-        is_active=True
-    )
-    
-    db.add(rule)
-    db.commit()
-    db.refresh(rule)
-    
-    return rule
-    # except Exception as e:
-    #     db.rollback()
-    #     raise HTTPException(
-    #         status_code=500,
-    #         detail=f"Error generating rule: {str(e)}"
-    #     )
+        
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        
+        return rule
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions without modification
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"Error generating rule: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating rule: {str(e)}"
+        )
+
+@app.put(f"{settings.API_V1_STR}/rules/{{rule_id}}/finish-draft", response_model=RuleResponse)
+async def finish_draft_rule(
+    rule_id: int,
+    db: Session = Depends(get_db)
+):
+    """Mark a draft rule as finalized after user modifications."""
+    try:
+        rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        if not rule:
+            raise HTTPException(status_code=404, detail="Rule not found")
+            
+        if not rule.is_draft:
+            return rule  # Already finalized
+            
+        # Check if the column in the rule exists
+        column_name = rule.rule_config.get("kwargs", {}).get("column")
+        if column_name:
+            with engine.connect() as connection:
+                result = connection.execute(text("""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = :table_name AND column_name = :column_name
+                """), {"table_name": rule.table_name, "column_name": column_name})
+                column_exists = result.first() is not None
+                
+            if not column_exists:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Column '{column_name}' still doesn't exist in table '{rule.table_name}'. Cannot finalize draft."
+                )
+        
+        # Update the rule
+        rule.is_draft = False
+        rule.confidence = 100  # User has verified the rule
+        
+        # Create a new version to track the change
+        new_version = RuleVersion(
+            rule_id=rule.id,
+            version_number=len(rule.versions) + 1,
+            rule_config=rule.rule_config,
+            is_current=True
+        )
+        
+        # Set all other versions as not current
+        for version in rule.versions:
+            version.is_current = False
+            
+        db.add(new_version)
+        db.commit()
+        db.refresh(rule)
+        
+        return rule
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error finalizing draft rule: {str(e)}"
+        )
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 

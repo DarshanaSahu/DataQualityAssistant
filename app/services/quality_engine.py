@@ -59,8 +59,8 @@ class DataQualityEngine:
         # Create an EphemeralDataContext
         try:
             self.context = EphemeralDataContext(
-                project_config=data_context_config
-            )
+            project_config=data_context_config
+        )
             print("Great Expectations context initialized successfully")
         except Exception as e:
             print(f"Error initializing context: {str(e)}")
@@ -176,6 +176,44 @@ class DataQualityEngine:
             # Make sure it's a list
             if not isinstance(rule_configs, list):
                 rule_configs = [rule_configs]
+            
+            # Helper function to convert sample rows to JSON-serializable format
+            def prepare_sample_rows(rows):
+                if not rows:
+                    return []
+                
+                result = []
+                for row in rows:
+                    # Convert each row to a serializable format
+                    serializable_row = {}
+                    for key, value in row.items():
+                        # Handle dates, datetimes and other special types
+                        if hasattr(value, 'isoformat'):
+                            serializable_row[key] = value.isoformat()
+                        elif pd.isna(value):
+                            serializable_row[key] = None
+                        elif isinstance(value, (pd.Series, pd.DataFrame)):
+                            serializable_row[key] = "COMPLEX_DATA"
+                        # Handle numpy types (including numpy.bool_)
+                        elif str(type(value)).startswith("<class 'numpy."):
+                            # Convert numpy types to native Python types
+                            serializable_row[key] = value.item() if hasattr(value, 'item') else str(value)
+                        else:
+                            serializable_row[key] = value
+                    result.append(serializable_row)
+                return result
+            
+            # New helper function to get complete row samples in a consistent format
+            def get_consistent_sample_rows(failing_mask, column_name, message=None, max_samples=5):
+                """Return complete table row samples for failing rows in a consistent format."""
+                if failing_mask.sum() == 0:  # No failures
+                    return []
+                    
+                # Get up to 5 complete rows from the dataframe where the validation failed
+                sample_rows = df[failing_mask].head(max_samples).to_dict('records')
+                
+                # Prepare the samples for serialization
+                return prepare_sample_rows(sample_rows)
                 
             # ----- NEW DIRECT APPROACH WITHOUT VALIDATOR -----
             # Process each expectation manually
@@ -188,67 +226,110 @@ class DataQualityEngine:
                     # Get the column to validate
                     column = kwargs.get('column')
                     
+                    # Get the "mostly" parameter if it exists
+                    mostly = kwargs.get('mostly', 1.0)  # Default to 1.0 (100% must pass)
+                    
                     # HANDLE SPECIFIC EXPECTATION TYPES
                     if expectation_type == 'expect_column_values_to_not_be_null':
                         # Check for null values
-                        null_count = df[column].isnull().sum()
-                        success = null_count == 0
+                        null_mask = df[column].isnull()
+                        null_count = null_mask.sum()
+                        element_count = len(df)
+                        unexpected_percent = (null_count / element_count * 100) if element_count > 0 else 0
+                        
+                        # Determine success based on mostly parameter
+                        success = unexpected_percent <= (1 - mostly) * 100
+                        
+                        # Get sample rows with failures - using consistent format
+                        sample_rows = []
+                        if null_count > 0:  # Always get samples if there are failures, regardless of mostly
+                            sample_rows = get_consistent_sample_rows(null_mask, column)
                         
                         return {
                             "expectation_type": expectation_type,
                             "success": success,
                             "result": {
-                                "element_count": len(df),
+                                "element_count": element_count,
                                 "unexpected_count": null_count,
-                                "unexpected_percent": (null_count / len(df) * 100) if len(df) > 0 else 0
-                            }
+                                "unexpected_percent": unexpected_percent
+                            },
+                            "sample_rows": sample_rows,
+                            "kwargs": kwargs
                         }
                         
                     elif expectation_type == 'expect_column_values_to_be_in_set':
                         # Check if values are in the specified set
                         value_set = kwargs.get('value_set', [])
-                        unexpected_values = df[df[column].notnull() & ~df[column].isin(value_set)][column]
+                        unexpected_mask = df[column].notnull() & ~df[column].isin(value_set)
+                        unexpected_values = df[unexpected_mask][column]
                         unexpected_count = len(unexpected_values)
-                        success = unexpected_count == 0
+                        element_count = len(df)
+                        unexpected_percent = (unexpected_count / element_count * 100) if element_count > 0 else 0
+                        
+                        # Determine success based on mostly parameter
+                        success = unexpected_percent <= (1 - mostly) * 100
+                        
+                        # Get sample rows with failures - using consistent format
+                        sample_rows = []
+                        if unexpected_count > 0:  # Always get samples if there are failures, regardless of mostly
+                            sample_rows = get_consistent_sample_rows(unexpected_mask, column)
                         
                         return {
                             "expectation_type": expectation_type,
                             "success": success,
                             "result": {
-                                "element_count": len(df),
+                                "element_count": element_count,
                                 "unexpected_count": unexpected_count,
-                                "unexpected_percent": (unexpected_count / len(df) * 100) if len(df) > 0 else 0,
-                                "unexpected_values": unexpected_values.head(10).tolist() if not success else []
-                            }
+                                "unexpected_percent": unexpected_percent,
+                                "unexpected_values": unexpected_values.head(10).tolist() if unexpected_count > 0 else []
+                            },
+                            "sample_rows": sample_rows,
+                            "kwargs": kwargs
                         }
-                    
+                        
                     elif expectation_type == 'expect_column_values_to_be_between':
-                        # Check if values are between min_value and max_value
+                        # Check if values are in range
                         min_value = kwargs.get('min_value')
                         max_value = kwargs.get('max_value')
                         
-                        # Handle cases where min or max might be None
-                        if min_value is not None and max_value is not None:
-                            unexpected_values = df[(df[column] < min_value) | (df[column] > max_value)][column]
-                        elif min_value is not None:
-                            unexpected_values = df[df[column] < min_value][column]
-                        elif max_value is not None:
-                            unexpected_values = df[df[column] > max_value][column]
-                        else:
-                            unexpected_values = pd.Series([])  # No constraints
+                        # Initialize masks
+                        below_min = pd.Series(False, index=df.index)
+                        above_max = pd.Series(False, index=df.index)
+                        
+                        # Check min threshold if specified
+                        if min_value is not None:
+                            below_min = df[column].notnull() & (df[column] < min_value)
                             
+                        # Check max threshold if specified  
+                        if max_value is not None:
+                            above_max = df[column].notnull() & (df[column] > max_value)
+                            
+                        # Combine masks for all out-of-range values
+                        unexpected_mask = below_min | above_max
+                        unexpected_values = df[unexpected_mask][column]
                         unexpected_count = len(unexpected_values)
-                        success = unexpected_count == 0
+                        element_count = len(df)
+                        unexpected_percent = (unexpected_count / element_count * 100) if element_count > 0 else 0
+                        
+                        # Determine success based on mostly parameter
+                        success = unexpected_percent <= (1 - mostly) * 100
+                        
+                        # Get sample rows with failures - using consistent format
+                        sample_rows = []
+                        if unexpected_count > 0:  # Always get samples if there are failures, regardless of mostly
+                            sample_rows = get_consistent_sample_rows(unexpected_mask, column)
                         
                         return {
                             "expectation_type": expectation_type,
                             "success": success,
                             "result": {
-                                "element_count": len(df),
+                                "element_count": element_count,
                                 "unexpected_count": unexpected_count,
-                                "unexpected_percent": (unexpected_count / len(df) * 100) if len(df) > 0 else 0,
-                                "unexpected_values": unexpected_values.head(10).tolist() if not success else []
-                            }
+                                "unexpected_percent": unexpected_percent,
+                                "unexpected_values": unexpected_values.head(10).tolist() if unexpected_count > 0 else []
+                            },
+                            "sample_rows": sample_rows,
+                            "kwargs": kwargs
                         }
                         
                     elif expectation_type == 'expect_column_values_to_match_regex':
@@ -259,39 +340,73 @@ class DataQualityEngine:
                         
                         # Apply the regex check to non-null values
                         mask = df[column].notnull()
-                        unexpected_values = df[mask & ~df[column].astype(str).str.match(pattern)][column]
+                        unexpected_mask = mask & ~df[column].astype(str).str.match(pattern)
+                        unexpected_values = df[unexpected_mask][column]
                         unexpected_count = len(unexpected_values)
-                        success = unexpected_count == 0
+                        element_count = len(df)
+                        unexpected_percent = (unexpected_count / element_count * 100) if element_count > 0 else 0
+                        
+                        # Determine success based on mostly parameter
+                        success = unexpected_percent <= (1 - mostly) * 100
+                        
+                        # Get sample rows with failures - using consistent format
+                        sample_rows = []
+                        if unexpected_count > 0:  # Always get samples if there are failures, regardless of mostly
+                            sample_rows = get_consistent_sample_rows(unexpected_mask, column)
                         
                         return {
                             "expectation_type": expectation_type,
                             "success": success,
                             "result": {
-                                "element_count": len(df),
+                                "element_count": element_count,
                                 "unexpected_count": unexpected_count,
-                                "unexpected_percent": (unexpected_count / len(df) * 100) if len(df) > 0 else 0,
-                                "unexpected_values": unexpected_values.head(10).tolist() if not success else []
-                            }
+                                "unexpected_percent": unexpected_percent,
+                                "unexpected_values": unexpected_values.head(10).tolist() if unexpected_count > 0 else []
+                            },
+                            "sample_rows": sample_rows,
+                            "kwargs": kwargs
                         }
                         
                     elif expectation_type == 'expect_column_values_to_be_unique':
-                        # Check for duplicate values
-                        value_counts = df[column].value_counts()
-                        duplicates = value_counts[value_counts > 1].index.tolist()
-                        duplicate_count = sum(value_counts[value_counts > 1] - 1)
-                        success = duplicate_count == 0
+                        # Find duplicated values
+                        duplicated_mask = df[column].duplicated(keep=False)
+                        duplicate_values = df[duplicated_mask][column].unique().tolist()
+                        duplicate_count = duplicated_mask.sum() - len(duplicate_values)
+                        element_count = len(df)
+                        unexpected_percent = (duplicate_count / element_count * 100) if element_count > 0 else 0
+                        
+                        # Determine success based on mostly parameter
+                        success = unexpected_percent <= (1 - mostly) * 100
+                        
+                        # Get sample rows with failures - using consistent format
+                        sample_rows = []
+                        if duplicate_count > 0:  # Always get samples if there are failures, regardless of mostly
+                            # For uniqueness, we want to include examples of each duplicate value
+                            # but still limit to a reasonable number of samples
+                            samples = []
+                            # Get up to 5 unique values that have duplicates
+                            for dup_val in duplicate_values[:5]:
+                                # Get up to 2 examples of each duplicate value
+                                dup_mask = df[column] == dup_val
+                                dup_samples = get_consistent_sample_rows(dup_mask, column, max_samples=2)
+                                samples.extend(dup_samples[:2])  # Add up to 2 examples
+                                if len(samples) >= 5:  # Cap at 5 total samples
+                                    break
+                            sample_rows = samples[:5]  # Ensure we don't exceed 5 samples
                         
                         return {
                             "expectation_type": expectation_type,
                             "success": success,
                             "result": {
-                                "element_count": len(df),
+                                "element_count": element_count,
                                 "unexpected_count": duplicate_count,
-                                "unexpected_percent": (duplicate_count / len(df) * 100) if len(df) > 0 else 0,
-                                "unexpected_values": duplicates[:10] if not success else []
-                            }
+                                "unexpected_percent": unexpected_percent,
+                                "unexpected_values": duplicate_values[:10] if duplicate_count > 0 else []
+                            },
+                            "sample_rows": sample_rows,
+                            "kwargs": kwargs
                         }
-                        
+                    
                     # Add more expectation types as needed
                     
                     else:
@@ -299,14 +414,19 @@ class DataQualityEngine:
                         return {
                             "expectation_type": expectation_type,
                             "success": False,
-                            "error": f"Expectation type '{expectation_type}' not implemented in direct evaluation mode"
+                            "error": f"Expectation type '{expectation_type}' not implemented in direct evaluation mode",
+                            "sample_rows": [],
+                            "kwargs": kwargs
                         }
                         
                 except Exception as e:
+                    # Return error details without sample rows
                     return {
                         "expectation_type": expectation_type,
                         "success": False,
-                        "error": str(e)
+                        "error": str(e),
+                        "sample_rows": [],
+                        "kwargs": kwargs
                     }
             
             # Process each expectation
@@ -353,6 +473,17 @@ class DataQualityEngine:
 
     def generate_report(self, execution_results: Dict[str, Any], output_path: str):
         """Generate Excel report from execution results."""
+        # Helper function to safely serialize complex objects including dates
+        def json_serialize_safe(obj):
+            if hasattr(obj, 'isoformat'):  # For datetime and date objects
+                return obj.isoformat()
+            elif isinstance(obj, pd.Series):
+                return obj.to_list()
+            elif pd.isna(obj):  # Handle NaN and None
+                return None
+            else:
+                return str(obj)  # Convert anything else to string
+        
         # Create overall summary sheet
         overall_summary = [{
             "Table Name": execution_results["table_name"],
@@ -395,9 +526,9 @@ class DataQualityEngine:
                     # Add specific result details based on what's available
                     for key, value in validation_result.items():
                         if key not in ["expectation_type", "success"]:
-                            # Format lists and dicts as JSON strings
+                            # Format lists and dicts as JSON strings with safe serialization
                             if isinstance(value, (list, dict)):
-                                value = json.dumps(value)
+                                value = json.dumps(value, default=json_serialize_safe)
                             data[key] = value
                     
                     detailed_data.append(data)

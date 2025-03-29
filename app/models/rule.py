@@ -12,6 +12,8 @@ class Rule(Base):
     table_name = Column(String, nullable=False)
     rule_config = Column(JSON, nullable=False)
     is_active = Column(Boolean, default=True)
+    is_draft = Column(Boolean, default=False)
+    confidence = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
@@ -21,10 +23,10 @@ class RuleVersion(Base):
     __tablename__ = "rule_versions"
 
     id = Column(Integer, primary_key=True, index=True)
-    rule_id = Column(Integer, ForeignKey("rules.id"))
+    rule_id = Column(Integer, ForeignKey("rules.id"), nullable=False)
     version_number = Column(Integer, nullable=False)
     rule_config = Column(JSON, nullable=False)
+    is_current = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    is_current = Column(Boolean, default=False)
     
     rule = relationship("Rule", back_populates="versions") 
